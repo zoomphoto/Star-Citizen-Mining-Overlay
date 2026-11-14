@@ -1,0 +1,10 @@
+# IRIS social config (TOML format). Shareable: contains no personal settings.
+format = "sc-social-overlay"
+format_version = 1
+orgs_main_org_only = false
+org_rules_main_org_only = false
+
+[[org_rules]]
+kind = "no_match"
+priority = 10
+color = "Grey"

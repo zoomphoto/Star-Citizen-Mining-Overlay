@@ -1,0 +1,12 @@
+# Default text normalization
+* text=auto
+
+# Ensure Linux scripts and desktop entries always have LF line endings
+*.sh text eol=lf
+*.desktop text eol=lf
+
+# Binary assets
+*.bin binary
+*.ico binary
+*.png binary
+*.ttf binary

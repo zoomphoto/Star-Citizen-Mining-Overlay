@@ -1,0 +1,31 @@
+[package]
+name = "iris-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "sc-overlay"
+
+[[bin]]
+name = "sc-overlay"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+open.workspace = true
+tiny-skia.workspace = true
+ab_glyph.workspace = true
+image.workspace = true
+iris-core.workspace = true
+iris-platform.workspace = true
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }

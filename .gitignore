@@ -1,0 +1,20 @@
+# Rust / Cargo build outputs
+/target/
+
+# Portable runtime directories (created when --portable or local Config/ exists)
+/Config/
+/Data/
+/Logs/
+
+# SQLite WAL / backup artifacts
+*.db
+*.db-shm
+*.db-wal
+*.bak
+*.tmp
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

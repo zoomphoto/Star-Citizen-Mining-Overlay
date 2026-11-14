@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/iris-core",
+    "crates/iris-platform",
+    "crates/iris-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/joesp/sc_overlay_rust"
+description = "Cross-platform Star Citizen nameplate, org intelligence, and mining overlay for Windows 11 and Bazzite Linux (inspired by Niteb1rd/IRIS)"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+scraper = "0.21"
+html-escape = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rustfft = "6.2"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+directories = "5.0"
+open = "5.3"
+tiny-skia = "0.11"
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+
+iris-core = { path = "crates/iris-core" }
+iris-platform = { path = "crates/iris-platform" }

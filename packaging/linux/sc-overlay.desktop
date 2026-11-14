@@ -1,0 +1,30 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=SC Overlay
+GenericName=Star Citizen Overlay
+Comment=Non-intrusive Star Citizen nameplate, organization intelligence, and mining HUD overlay
+Exec=sc-overlay
+Icon=sc-overlay
+Terminal=false
+Categories=Game;Utility;
+Keywords=Star Citizen;RSI;Overlay;IRIS;Mining;
+StartupNotify=false
+StartupWMClass=sc-overlay
+Actions=ToggleOverlay;TimedPeek;InteractiveDossier;Quit;
+
+[Desktop Action ToggleOverlay]
+Name=Toggle Overlay On/Off
+Exec=sc-overlay --toggle
+
+[Desktop Action TimedPeek]
+Name=Timed Overlay Peek
+Exec=sc-overlay --timed
+
+[Desktop Action InteractiveDossier]
+Name=Interactive Citizen Dossier
+Exec=sc-overlay --interactive
+
+[Desktop Action Quit]
+Name=Quit SC Overlay
+Exec=sc-overlay --quit

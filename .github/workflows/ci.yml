@@ -1,0 +1,103 @@
+name: CI & Cross-Platform Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows 11 (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace unit tests
+        run: cargo test --workspace --locked || cargo test --workspace
+
+      - name: Build Windows release binary
+        run: cargo build --release --bin sc-overlay
+
+      - name: Smoke check CLI flags
+        run: |
+          $ver = .\target\release\sc-overlay.exe --version | Out-String
+          $hlp = .\target\release\sc-overlay.exe --help | Out-String
+          Write-Host $ver
+          Write-Host $hlp
+          if (-not $ver.Contains("sc-overlay")) { throw "Missing version output" }
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sc-overlay-windows-x86_64
+          path: |
+            target/release/sc-overlay.exe
+            LICENSE
+            THIRD-PARTY-NOTICES.md
+            README.md
+
+  linux:
+    name: Bazzite / Fedora / Linux (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Wayland, X11 & OpenGL headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libgl1-mesa-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace unit tests
+        run: cargo test --workspace --locked || cargo test --workspace
+
+      - name: Build Linux release binary
+        run: cargo build --release --bin sc-overlay
+
+      - name: Smoke check CLI flags
+        run: |
+          ./target/release/sc-overlay --version
+          ./target/release/sc-overlay --help
+
+      - name: Package Linux bundle for Bazzite / Fedora
+        run: |
+          mkdir -p dist/sc-overlay-linux-x86_64/packaging/linux
+          cp target/release/sc-overlay dist/sc-overlay-linux-x86_64/sc-overlay
+          cp packaging/linux/install-bazzite.sh dist/sc-overlay-linux-x86_64/packaging/linux/
+          cp packaging/linux/sc-overlay.desktop dist/sc-overlay-linux-x86_64/packaging/linux/
+          if [ -f packaging/linux/sc-overlay.png ]; then
+            cp packaging/linux/sc-overlay.png dist/sc-overlay-linux-x86_64/packaging/linux/
+          fi
+          cp LICENSE THIRD-PARTY-NOTICES.md README.md dist/sc-overlay-linux-x86_64/
+          chmod +x dist/sc-overlay-linux-x86_64/sc-overlay dist/sc-overlay-linux-x86_64/packaging/linux/install-bazzite.sh
+
+      - name: Upload Linux release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sc-overlay-linux-x86_64
+          path: dist/sc-overlay-linux-x86_64/
