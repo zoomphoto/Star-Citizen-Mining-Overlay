@@ -45,6 +45,7 @@ impl CliOptions {
                 "--minimized" | "--tray" | "--silent" => opts.start_minimized = true,
                 "--settings" => opts.ipc_cmd = Some(IpcCommand::OpenSettings),
                 "--toggle" => opts.ipc_cmd = Some(IpcCommand::ToggleOverlay),
+                "--debug" => opts.ipc_cmd = Some(IpcCommand::ToggleDebugOverlay),
                 "--timed" => opts.ipc_cmd = Some(IpcCommand::TimedOverlay),
                 "--interactive" => opts.ipc_cmd = Some(IpcCommand::InteractiveOverlay),
                 "--quit" => opts.ipc_cmd = Some(IpcCommand::Quit),
@@ -95,6 +96,7 @@ fn main() -> anyhow::Result<()> {
                --settings      Open or focus the Settings window\n  \
                --minimized     Start hidden in the system tray\n  \
                --toggle        Toggle the overlay on/off (signals running instance)\n  \
+               --debug         Toggle the live Debug / Heartbeat HUD on/off (signals running instance)\n  \
                --timed         Trigger timed overlay peek (signals running instance)\n  \
                --interactive   Open/close Interactive Citizen Dossier (signals running instance)\n  \
                --quit          Stop a running SC Overlay instance\n  \
@@ -155,7 +157,12 @@ fn main() -> anyhow::Result<()> {
     // - Visible on normal launch or `--settings`
     let action_only = matches!(
         cli.ipc_cmd,
-        Some(IpcCommand::ToggleOverlay | IpcCommand::TimedOverlay | IpcCommand::InteractiveOverlay)
+        Some(
+            IpcCommand::ToggleOverlay
+                | IpcCommand::ToggleDebugOverlay
+                | IpcCommand::TimedOverlay
+                | IpcCommand::InteractiveOverlay
+        )
     );
     let start_settings_open = !cli.start_minimized && !action_only;
 

@@ -52,6 +52,7 @@ pub enum HotkeyAction {
 pub enum TrayAction {
     OpenSettings,
     ToggleOverlay,
+    ToggleDebugOverlay,
     OpenLogs,
     OpenConfigDir,
     Quit,
@@ -99,6 +100,7 @@ pub trait HotkeyListener: Send {
 
 pub trait TrayBackend: Send {
     fn set_overlay_enabled(&mut self, enabled: bool);
+    fn set_debug_enabled(&mut self, enabled: bool);
     fn try_recv(&self) -> Option<TrayAction>;
 }
 
@@ -146,14 +148,23 @@ pub fn create_hotkey_listener(settings: &AppSettings) -> Box<dyn HotkeyListener>
     }
 }
 
-pub fn create_tray_backend(overlay_enabled: bool) -> anyhow::Result<Box<dyn TrayBackend>> {
+pub fn create_tray_backend(
+    overlay_enabled: bool,
+    debug_enabled: bool,
+) -> anyhow::Result<Box<dyn TrayBackend>> {
     #[cfg(windows)]
     {
-        Ok(Box::new(win32::Win32TrayBackend::new(overlay_enabled)?))
+        Ok(Box::new(win32::Win32TrayBackend::new(
+            overlay_enabled,
+            debug_enabled,
+        )?))
     }
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(linux::LinuxTrayBackend::new(overlay_enabled)?))
+        Ok(Box::new(linux::LinuxTrayBackend::new(
+            overlay_enabled,
+            debug_enabled,
+        )?))
     }
 }
 

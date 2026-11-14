@@ -1,11 +1,26 @@
 use crate::config::settings::AppSettings;
 use crate::mining::reader::MiningSettings;
-use crate::models::{MiningLabelItem, OverlayModel, PixelRect};
+use crate::models::{
+    DebugBoxKind, DebugOverlayInfo, MiningLabelItem, OverlayModel, PixelRect,
+};
 use crate::overlay::metrics::{BracketMetrics, BracketRasterizer};
 use crate::overlay::panel::{PanelLayout, PanelLayoutResult};
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use std::sync::OnceLock;
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
+
+struct DebugHudLayout {
+    card_rect: PixelRect,
+    scale: f64,
+    header_px: f32,
+    body_px: f32,
+    header_h: f64,
+    line_h: f64,
+    pad_x: f64,
+    pad_y: f64,
+    dot_space: f64,
+    pips_reserve: f64,
+}
 
 const QUANTICO_BOLD_TTF: &[u8] = include_bytes!("../../../../assets/Quantico-Bold.ttf");
 
@@ -155,6 +170,17 @@ impl SoftwareOverlayPainter {
             mining_layouts.push((m_item, layout));
         }
 
+        let debug_layout = model.debug_info.as_ref().map(|dbg| {
+            let layout = Self::compute_debug_layout(dbg, screen_w, screen_h);
+            Self::draw_debug_vectors(
+                pixmap,
+                dbg,
+                &layout,
+                model.boundary_rect.is_some(),
+            );
+            layout
+        });
+
         // Copy tiny-skia's premultiplied RGBA8 buffer into reusable BGRA8 buffer,
         // swapping R <-> B only on non-transparent pixels (98%+ of overlay is transparent 0x00000000).
         let src_rgba = pixmap.data();
@@ -224,6 +250,10 @@ impl SoftwareOverlayPainter {
                 ),
                 false,
             );
+        }
+
+        if let (Some(dbg), Some(layout)) = (model.debug_info.as_ref(), debug_layout.as_ref()) {
+            Self::draw_debug_text(bgra, w, h, dbg, layout);
         }
 
         &self.bgra_buf[..total_bytes]
@@ -426,8 +456,37 @@ impl SoftwareOverlayPainter {
         box_top: f64,
         max_width: f64,
         box_height: f64,
+        px_size: f32,
+        center: bool,
+    ) {
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            text,
+            x,
+            box_top,
+            max_width,
+            box_height,
+            px_size,
+            center,
+            (255, 255, 255),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_outlined_text_rgb(
+        bgra: &mut [u8],
+        w: usize,
+        h: usize,
+        text: &str,
+        x: f64,
+        box_top: f64,
+        max_width: f64,
+        box_height: f64,
         mut px_size: f32,
         center: bool,
+        rgb: (u8, u8, u8),
     ) {
         let (mut tw, mut th) = Self::measure_text(text, px_size);
         if tw as f64 > max_width && tw > 0.0 {
@@ -442,7 +501,7 @@ impl SoftwareOverlayPainter {
         } as f32;
         let draw_y = (box_top + (box_height - th as f64) * 0.5) as f32;
 
-        // 8-direction dark outline (`#E60A0A0F`) followed by crisp white fill
+        // 8-direction dark outline (`#E60A0A0F`) followed by crisp fill
         let edge = (px_size * 0.08).max(1.0).round() as i32;
         for dy in -edge..=edge {
             for dx in -edge..=edge {
@@ -473,9 +532,237 @@ impl SoftwareOverlayPainter {
             draw_x,
             draw_y,
             px_size,
-            (255, 255, 255, 255),
+            (rgb.0, rgb.1, rgb.2, 255),
             false,
         );
+    }
+
+    fn compute_debug_layout(
+        dbg: &DebugOverlayInfo,
+        screen_w: f64,
+        screen_h: f64,
+    ) -> DebugHudLayout {
+        let scale = (screen_h / BracketMetrics::REFERENCE_SCREEN_HEIGHT).clamp(0.65, 2.2);
+        let header_px = (14.5 * scale) as f32;
+        let body_px = (12.5 * scale) as f32;
+        let header_h = (header_px as f64) * 1.45;
+        let line_h = (body_px as f64) * 1.35;
+        let pad_x = 12.0 * scale;
+        let pad_y = 8.0 * scale;
+        let dot_space = 18.0 * scale;
+        let pips_reserve = 50.0 * scale;
+
+        let (hw, _) = Self::measure_text(&dbg.headline, header_px);
+        let mut max_content_w = (hw as f64) + dot_space + pips_reserve;
+        for line in &dbg.lines {
+            let (lw, _) = Self::measure_text(line, body_px);
+            max_content_w = max_content_w.max(lw as f64);
+        }
+        let min_w = 410.0 * scale;
+        let card_w = (max_content_w.max(min_w) + 2.0 * pad_x)
+            .min((screen_w * 0.65).max(160.0))
+            .ceil();
+        let card_h = (pad_y * 2.0 + header_h + (dbg.lines.len() as f64) * line_h + 4.0 * scale)
+            .ceil();
+        let card_x = (screen_w * 0.015).round();
+        let card_y = (screen_h * 0.02).round();
+
+        DebugHudLayout {
+            card_rect: PixelRect::new(card_x, card_y, card_w, card_h),
+            scale,
+            header_px,
+            body_px,
+            header_h,
+            line_h,
+            pad_x,
+            pad_y,
+            dot_space,
+            pips_reserve,
+        }
+    }
+
+    fn draw_stroked_rect(
+        pixmap: &mut Pixmap,
+        r: PixelRect,
+        stroke_w: f32,
+        rgba: (u8, u8, u8, u8),
+    ) {
+        if r.width <= 1.0 || r.height <= 1.0 {
+            return;
+        }
+        let Some(rect) = tiny_skia::Rect::from_xywh(
+            r.x as f32,
+            r.y as f32,
+            r.width as f32,
+            r.height as f32,
+        ) else {
+            return;
+        };
+        let path = PathBuilder::from_rect(rect);
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(rgba.0, rgba.1, rgba.2, rgba.3);
+        paint.anti_alias = true;
+        let mut stroke = Stroke {
+            width: stroke_w.max(1.0),
+            ..Stroke::default()
+        };
+        stroke.line_join = tiny_skia::LineJoin::Round;
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+
+    fn draw_debug_vectors(
+        pixmap: &mut Pixmap,
+        dbg: &DebugOverlayInfo,
+        layout: &DebugHudLayout,
+        boundary_already_drawn: bool,
+    ) {
+        let s = layout.scale as f32;
+        if !boundary_already_drawn {
+            if let Some(scan_area) = dbg.scan_boundary {
+                Self::draw_stroked_rect(
+                    pixmap,
+                    scan_area,
+                    (1.2 * s).max(1.0),
+                    (0x00, 0xE5, 0xFF, 0x48),
+                );
+            }
+        }
+
+        for cand in &dbg.candidate_boxes {
+            let (rgba, sw) = match cand.kind {
+                DebugBoxKind::Candidate => ((0x00, 0xE5, 0xFF, 0x80), 1.2 * s),
+                DebugBoxKind::PairedCandidate => ((0xFF, 0xD5, 0x00, 0xDC), 1.6 * s),
+                DebugBoxKind::TentativeTrack => ((0xFF, 0x3D, 0xDB, 0xEB), 2.0 * s),
+            };
+            Self::draw_stroked_rect(pixmap, cand.rect, sw.max(1.0), rgba);
+        }
+
+        // Card background & colored status border
+        let (sr, sg, sb) = dbg.level.rgb();
+        let radius = 6.0 * layout.scale;
+        Self::draw_rounded_box(
+            pixmap,
+            layout.card_rect,
+            radius,
+            Color::from_rgba8(0x0B, 0x0F, 0x17, 0xE0),
+        );
+        Self::draw_stroked_rect(
+            pixmap,
+            PixelRect::new(
+                layout.card_rect.x + 0.5,
+                layout.card_rect.y + 0.5,
+                (layout.card_rect.width - 1.0).max(1.0),
+                (layout.card_rect.height - 1.0).max(1.0),
+            ),
+            (1.2 * s).max(1.0),
+            (sr, sg, sb, 0xB8),
+        );
+
+        // Subtle divider line below headline
+        let div_y = (layout.card_rect.y + layout.pad_y + layout.header_h + 1.5 * layout.scale) as f32;
+        if let Some(div_rect) = tiny_skia::Rect::from_xywh(
+            (layout.card_rect.x + layout.pad_x) as f32,
+            div_y,
+            (layout.card_rect.width - 2.0 * layout.pad_x).max(1.0) as f32,
+            (1.0 * s).max(1.0),
+        ) {
+            let mut div_paint = Paint::default();
+            div_paint.set_color_rgba8(sr, sg, sb, 0x3A);
+            pixmap.fill_rect(div_rect, &div_paint, Transform::identity(), None);
+        }
+
+        // Pulsing status dot on header left
+        let dot_cx = (layout.card_rect.x + layout.pad_x + 5.5 * layout.scale) as f32;
+        let dot_cy = (layout.card_rect.y + layout.pad_y + layout.header_h * 0.5) as f32;
+        let pulse_on = (dbg.heartbeat_phase & 1) == 0;
+        let pulse_expand = if pulse_on { 6.8 * s } else { 5.2 * s };
+        let pulse_alpha = if pulse_on { 0x58 } else { 0x28 };
+        if let Some(outer) = PathBuilder::from_circle(dot_cx, dot_cy, pulse_expand.max(2.0)) {
+            let mut p = Paint::default();
+            p.set_color_rgba8(sr, sg, sb, pulse_alpha);
+            p.anti_alias = true;
+            pixmap.fill_path(&outer, &p, FillRule::Winding, Transform::identity(), None);
+        }
+        if let Some(inner) = PathBuilder::from_circle(dot_cx, dot_cy, (3.8 * s).max(1.5)) {
+            let mut p = Paint::default();
+            p.set_color_rgba8(sr, sg, sb, 0xFF);
+            p.anti_alias = true;
+            pixmap.fill_path(&inner, &p, FillRule::Winding, Transform::identity(), None);
+        }
+
+        // Marching 4-pip heartbeat scanner bar on header right
+        let pip_w = 7.0 * layout.scale;
+        let pip_h = 5.5 * layout.scale;
+        let pip_gap = 3.5 * layout.scale;
+        let total_pips_w = 4.0 * pip_w + 3.0 * pip_gap;
+        let pips_x0 = layout.card_rect.right() - layout.pad_x - total_pips_w;
+        let pips_y = layout.card_rect.y + layout.pad_y + (layout.header_h - pip_h) * 0.5;
+        let active_pip = (dbg.heartbeat_phase % 4) as usize;
+        let trail_pip = ((dbg.heartbeat_phase + 3) % 4) as usize;
+
+        for idx in 0..4 {
+            let px = pips_x0 + idx as f64 * (pip_w + pip_gap);
+            let col = if idx == active_pip {
+                Color::from_rgba8(sr, sg, sb, 0xFF)
+            } else if idx == trail_pip {
+                Color::from_rgba8(sr, sg, sb, 0x70)
+            } else {
+                Color::from_rgba8(0xFF, 0xFF, 0xFF, 0x24)
+            };
+            Self::draw_rounded_box(
+                pixmap,
+                PixelRect::new(px, pips_y, pip_w, pip_h),
+                1.5 * layout.scale,
+                col,
+            );
+        }
+    }
+
+    fn draw_debug_text(
+        bgra: &mut [u8],
+        w: usize,
+        h: usize,
+        dbg: &DebugOverlayInfo,
+        layout: &DebugHudLayout,
+    ) {
+        let (sr, sg, sb) = dbg.level.rgb();
+        let head_max_w = (layout.card_rect.width
+            - 2.0 * layout.pad_x
+            - layout.dot_space
+            - layout.pips_reserve)
+            .max(20.0);
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            &dbg.headline,
+            layout.card_rect.x + layout.pad_x + layout.dot_space,
+            layout.card_rect.y + layout.pad_y,
+            head_max_w,
+            layout.header_h,
+            layout.header_px,
+            false,
+            (sr, sg, sb),
+        );
+
+        let body_max_w = (layout.card_rect.width - 2.0 * layout.pad_x).max(20.0);
+        let body_top0 =
+            layout.card_rect.y + layout.pad_y + layout.header_h + 3.5 * layout.scale;
+        for (i, line) in dbg.lines.iter().enumerate() {
+            Self::draw_outlined_text_rgb(
+                bgra,
+                w,
+                h,
+                line,
+                layout.card_rect.x + layout.pad_x,
+                body_top0 + i as f64 * layout.line_h,
+                body_max_w,
+                layout.line_h,
+                layout.body_px,
+                false,
+                (232, 238, 246),
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

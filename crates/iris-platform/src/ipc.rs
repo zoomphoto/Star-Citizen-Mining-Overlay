@@ -10,6 +10,7 @@ use std::time::Duration;
 pub enum IpcCommand {
     OpenSettings,
     ToggleOverlay,
+    ToggleDebugOverlay,
     TimedOverlay,
     InteractiveOverlay,
     Quit,
@@ -20,6 +21,7 @@ impl IpcCommand {
         match self {
             IpcCommand::OpenSettings => "settings",
             IpcCommand::ToggleOverlay => "toggle",
+            IpcCommand::ToggleDebugOverlay => "debug",
             IpcCommand::TimedOverlay => "timed",
             IpcCommand::InteractiveOverlay => "interactive",
             IpcCommand::Quit => "quit",
@@ -30,6 +32,7 @@ impl IpcCommand {
         match s.trim() {
             "settings" => Some(IpcCommand::OpenSettings),
             "toggle" => Some(IpcCommand::ToggleOverlay),
+            "debug" => Some(IpcCommand::ToggleDebugOverlay),
             "timed" => Some(IpcCommand::TimedOverlay),
             "interactive" => Some(IpcCommand::InteractiveOverlay),
             "quit" => Some(IpcCommand::Quit),

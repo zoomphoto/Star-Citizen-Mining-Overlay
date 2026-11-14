@@ -67,6 +67,8 @@ pub struct AppSettings {
     pub timed_overlay_seconds: i32,
     pub mining_disabled: bool,
     pub mining_label_zoom_percent: i32,
+    pub debug_overlay_enabled: bool,
+    pub debug_show_candidates: bool,
     /// Linux XDG ScreenCast portal restore token so Bazzite Wayland only prompts once
     pub linux_portal_restore_token: String,
 }
@@ -138,6 +140,8 @@ impl Default for AppSettings {
             timed_overlay_seconds: 10,
             mining_disabled: false,
             mining_label_zoom_percent: 150,
+            debug_overlay_enabled: false,
+            debug_show_candidates: false,
             linux_portal_restore_token: String::new(),
         }
     }
@@ -327,6 +331,14 @@ impl AppSettingsToml {
                 AppSettings::MINING_ZOOM_MIN,
                 AppSettings::MINING_ZOOM_MAX
             )
+        ));
+        out.push_str(&format!(
+            "debug_overlay_enabled = {}\n",
+            bool_str(settings.debug_overlay_enabled)
+        ));
+        out.push_str(&format!(
+            "debug_show_candidates = {}\n",
+            bool_str(settings.debug_show_candidates)
         ));
         if !settings.linux_portal_restore_token.is_empty() {
             out.push_str(&format!(
@@ -638,6 +650,18 @@ impl AppSettingsToml {
             AppSettings::MINING_ZOOM_STEP,
             AppSettings::MINING_ZOOM_MIN,
             AppSettings::MINING_ZOOM_MAX,
+        );
+        s.debug_overlay_enabled = read_bool(
+            &root,
+            "debug_overlay_enabled",
+            defaults.debug_overlay_enabled,
+            &mut warnings,
+        );
+        s.debug_show_candidates = read_bool(
+            &root,
+            "debug_show_candidates",
+            defaults.debug_show_candidates,
+            &mut warnings,
         );
 
         if let Some(od) = root.get("panel_org_display").and_then(|v| v.as_str()) {

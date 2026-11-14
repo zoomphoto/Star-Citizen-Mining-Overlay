@@ -320,6 +320,40 @@ mod tests {
         };
         rast.draw(&mut small, 400 * 4, 400, 400, &[item], 0.0, 0.0, 1080.0);
         assert!(small.chunks_exact(4).any(|px| px[3] > 0));
+
+        // Verify Debug HUD & candidate box rendering when 0 targets are on screen
+        let dbg_settings = AppSettings {
+            debug_overlay_enabled: true,
+            debug_show_candidates: true,
+            ..AppSettings::default()
+        };
+        let round_trip_dbg = AppSettingsToml::read(&AppSettingsToml::write(&dbg_settings));
+        assert!(round_trip_dbg.is_valid());
+        assert!(round_trip_dbg.settings.debug_overlay_enabled);
+        assert!(round_trip_dbg.settings.debug_show_candidates);
+
+        let dbg_model = TestOverlayBuilder::build(
+            &social,
+            1920.0,
+            1080.0,
+            Some(boundary),
+            TestOverlayPart::DebugHud,
+            Some(&dbg_settings),
+        );
+        assert!(dbg_model.brackets.is_empty());
+        assert!(dbg_model.panel_entries.is_empty());
+        assert!(!dbg_model.is_empty());
+        let dbg_bgra = painter.paint(&dbg_model, &dbg_settings, 1920, 1080);
+        let dbg_visible = dbg_bgra.chunks_exact(4).filter(|px| px[3] > 0).count();
+        assert!(
+            dbg_visible > 500,
+            "expected visible Debug HUD pixels even with 0 brackets, got {}",
+            dbg_visible
+        );
+        // Verify premultiplied BGRA8 invariant (B, G, R <= A)
+        assert!(dbg_bgra
+            .chunks_exact(4)
+            .all(|px| px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]));
     }
 
     #[test]

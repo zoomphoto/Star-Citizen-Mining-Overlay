@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 struct ScOverlayKsniTray {
     overlay_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
     tx: Sender<TrayAction>,
     icon_on: Vec<ksni::Icon>,
     icon_off: Vec<ksni::Icon>,
@@ -44,6 +45,12 @@ impl ksni::Tray for ScOverlayKsniTray {
         } else {
             "Enable Overlay"
         };
+        let debug_on = self.debug_enabled.load(Ordering::Relaxed);
+        let debug_label = if debug_on {
+            "Hide Debug HUD"
+        } else {
+            "Show Debug HUD"
+        };
 
         vec![
             StandardItem {
@@ -58,6 +65,14 @@ impl ksni::Tray for ScOverlayKsniTray {
                 label: toggle_label.to_string(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.tx.send(TrayAction::ToggleOverlay);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: debug_label.to_string(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.tx.send(TrayAction::ToggleDebugOverlay);
                 }),
                 ..Default::default()
             }
@@ -94,16 +109,19 @@ impl ksni::Tray for ScOverlayKsniTray {
 
 pub struct LinuxTrayBackend {
     overlay_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
     handle: Handle<ScOverlayKsniTray>,
     rx: Receiver<TrayAction>,
 }
 
 impl LinuxTrayBackend {
-    pub fn new(overlay_enabled: bool) -> anyhow::Result<Self> {
+    pub fn new(overlay_enabled: bool, debug_enabled: bool) -> anyhow::Result<Self> {
         let flag = Arc::new(AtomicBool::new(overlay_enabled));
+        let debug_flag = Arc::new(AtomicBool::new(debug_enabled));
         let (tx, rx) = unbounded();
         let tray = ScOverlayKsniTray {
             overlay_enabled: Arc::clone(&flag),
+            debug_enabled: Arc::clone(&debug_flag),
             tx,
             icon_on: decode_ico_to_ksni(TRAY_ON_ICO),
             icon_off: decode_ico_to_ksni(TRAY_OFF_ICO),
@@ -116,6 +134,7 @@ impl LinuxTrayBackend {
         let _ = std::marker::PhantomData::<SubMenu<ScOverlayKsniTray>>;
         Ok(Self {
             overlay_enabled: flag,
+            debug_enabled: debug_flag,
             handle,
             rx,
         })
@@ -125,6 +144,11 @@ impl LinuxTrayBackend {
 impl TrayBackend for LinuxTrayBackend {
     fn set_overlay_enabled(&mut self, enabled: bool) {
         self.overlay_enabled.store(enabled, Ordering::Relaxed);
+        let _ = self.handle.update(|_| {});
+    }
+
+    fn set_debug_enabled(&mut self, enabled: bool) {
+        self.debug_enabled.store(enabled, Ordering::Relaxed);
         let _ = self.handle.update(|_| {});
     }
 

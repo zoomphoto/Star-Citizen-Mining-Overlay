@@ -4,8 +4,8 @@ use crate::config::social::{
     SocialConfig,
 };
 use crate::models::{
-    BracketItem, ColorMatch, MatchKind, OrgMembership, OverlayModel, PanelEntry, PanelOrgs,
-    PixelRect,
+    BracketItem, ColorMatch, DebugBoxKind, DebugCandidateBox, DebugOverlayInfo, DebugStatusLevel,
+    MatchKind, OrgMembership, OverlayModel, PanelEntry, PanelOrgs, PixelRect,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -864,6 +864,7 @@ impl StarCitizenDisplaySettings {
 pub enum TestOverlayPart {
     Boundary,
     Panel,
+    DebugHud,
 }
 
 pub struct TestOverlayBuilder;
@@ -1030,6 +1031,7 @@ impl TestOverlayBuilder {
                     note: None,
                     boundary_rect: None,
                     dossier_placeholder,
+                    debug_info: None,
                 }
             }
             TestOverlayPart::Boundary => OverlayModel {
@@ -1042,7 +1044,57 @@ impl TestOverlayBuilder {
                 note: None,
                 boundary_rect: Some(area.to_pixels(screen_width, screen_height)),
                 dossier_placeholder: None,
+                debug_info: None,
             },
+            TestOverlayPart::DebugHud => {
+                let show_cands = settings.map(|s| s.debug_show_candidates).unwrap_or(false);
+                let mut candidate_boxes = Vec::new();
+                if show_cands {
+                    for (idx, b) in brackets.iter().take(4).enumerate() {
+                        let kind = match idx {
+                            0 => DebugBoxKind::TentativeTrack,
+                            1 => DebugBoxKind::PairedCandidate,
+                            _ => DebugBoxKind::Candidate,
+                        };
+                        candidate_boxes.push(DebugCandidateBox {
+                            rect: b.name_box,
+                            kind,
+                        });
+                    }
+                }
+                let scan_boundary = if show_cands {
+                    Some(area.to_pixels(screen_width, screen_height))
+                } else {
+                    None
+                };
+                OverlayModel {
+                    window_width: screen_width as i32,
+                    window_height: screen_height as i32,
+                    brackets: Vec::new(),
+                    panel_entries: Vec::new(),
+                    mining_labels: Vec::new(),
+                    toast: None,
+                    note: None,
+                    boundary_rect: None,
+                    dossier_placeholder: None,
+                    debug_info: Some(DebugOverlayInfo {
+                        level: DebugStatusLevel::Active,
+                        headline: "PREVIEW - SCANNING (IDLE)  #0042".to_string(),
+                        lines: vec![
+                            format!(
+                                "Loop: 90 Hz  |  Cap: 60 FPS ({}x{})  |  Scan: 1.4 ms",
+                                screen_width as i32, screen_height as i32
+                            ),
+                            "Plates: 4 boxes, 1 pair, 1 OCR  |  Tracks: 0 conf, 1 tent  |  RSI: 0"
+                                .to_string(),
+                            "Mining: Searching  |  Last OCR: none (preview mode)".to_string(),
+                        ],
+                        heartbeat_phase: 0,
+                        candidate_boxes,
+                        scan_boundary,
+                    }),
+                }
+            }
         }
     }
 

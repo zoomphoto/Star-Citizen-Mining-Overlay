@@ -12,8 +12,8 @@ use crate::mining::{
     MiningTableSource, SignalState, TableSnap,
 };
 use crate::models::{
-    BracketItem, MarkerIdentity, MiningLabelItem, OrgMembership, OverlayModel, PanelEntry,
-    PanelOrgs, PlateColor, RsiState,
+    BracketItem, DebugBoxKind, DebugCandidateBox, MarkerIdentity, MiningLabelItem, OrgMembership,
+    OverlayModel, PanelEntry, PanelOrgs, PlateColor, RsiState,
 };
 use crate::overlay::TrackingBoundary;
 use crate::pipeline::tracker::{
@@ -30,6 +30,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
@@ -118,11 +119,36 @@ impl CapturedFrame {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct PipelineStats {
+    pub tick: i64,
+    pub process_ms: f64,
+    pub candidate_boxes: usize,
+    pub candidate_pairs: usize,
+    pub ocr_reads: usize,
+    pub observations_accepted: usize,
+    pub confirmed_tracks: usize,
+    pub tentative_tracks: usize,
+    pub in_flight_lookups: usize,
+    pub mining_locked: Option<String>,
+    pub last_read_sample: Option<(String, &'static str, f64)>,
+    pub debug_boxes: Vec<DebugCandidateBox>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct PipelineSnapshot {
     pub model: OverlayModel,
     pub roster: Vec<RosterEntry>,
     pub blank_picture: bool,
     pub aberration: Option<AberrationState>,
+    pub stats: PipelineStats,
+}
+
+struct ScanPlateResult {
+    observations: Vec<Observation>,
+    candidate_boxes: usize,
+    candidate_pairs: usize,
+    ocr_reads: usize,
+    debug_boxes: Vec<DebugCandidateBox>,
 }
 
 struct LookupWorkerRequest {
@@ -163,6 +189,7 @@ pub struct LiveDetectionPipeline {
     pipeline_settings: PipelineSettings,
     live_settings: LiveSettings,
     tick_counter: i64,
+    last_read_sample: Option<(String, &'static str, f64)>,
     in_flight_lookups: HashMap<String, f64>,
     lookup_tx: Sender<LookupWorkerRequest>,
     lookup_rx: Receiver<LookupWorkerResult>,
@@ -227,6 +254,7 @@ impl LiveDetectionPipeline {
             pipeline_settings,
             live_settings: LiveSettings::default(),
             tick_counter: 0,
+            last_read_sample: None,
             in_flight_lookups: HashMap::new(),
             lookup_tx: req_tx,
             lookup_rx: res_rx,
@@ -242,6 +270,7 @@ impl LiveDetectionPipeline {
         self.white_dupes.clear();
         self.mining_lock = None;
         self.blank_watch.reset();
+        self.last_read_sample = None;
     }
 
     /// Requests a profile/orgs lookup for an arbitrary handle (e.g. from Interactive Overlay search).
@@ -270,6 +299,7 @@ impl LiveDetectionPipeline {
         settings: &AppSettings,
         social: &SocialConfig,
     ) -> PipelineSnapshot {
+        let process_start = Instant::now();
         self.tick_counter += 1;
         let now_ms = frame.captured_ms;
         let win_w = frame.bgr.width as i32;
@@ -292,11 +322,27 @@ impl LiveDetectionPipeline {
                 ..Default::default()
             };
             model.panel_entries = self.build_panel_entries(now_ms, social);
+            let confirmed_tracks = self
+                .tracker
+                .markers
+                .iter()
+                .filter(|m| m.status == PlateStatus::Confirmed)
+                .count();
+            let tentative_tracks = self.tracker.markers.len().saturating_sub(confirmed_tracks);
             return PipelineSnapshot {
                 model,
                 roster: InteractiveRoster::build(&self.tracker, now_ms),
                 blank_picture: true,
                 aberration: Some(self.aberration_state),
+                stats: PipelineStats {
+                    tick: self.tick_counter,
+                    process_ms: process_start.elapsed().as_secs_f64() * 1000.0,
+                    confirmed_tracks,
+                    tentative_tracks,
+                    in_flight_lookups: self.in_flight_lookups.len(),
+                    last_read_sample: self.last_read_sample.clone(),
+                    ..Default::default()
+                },
             };
         }
 
@@ -307,12 +353,15 @@ impl LiveDetectionPipeline {
         self.detector.settings_mut().region_right = boundary.right;
         self.detector.settings_mut().region_bottom = boundary.bottom;
 
+        let collect_debug_boxes = settings.debug_overlay_enabled && settings.debug_show_candidates;
+
         // 4. Detect & read candidate nameplates
-        let observations = self.scan_and_read_plates(&frame.bgr, now_ms, social);
+        let mut scan_res =
+            self.scan_and_read_plates(&frame.bgr, now_ms, social, collect_debug_boxes);
 
         // 5. Update Hungarian + sub-pixel velocity tracker
         let forgotten = self.tracker.update(
-            &observations,
+            &scan_res.observations,
             now_ms,
             settings.tracking_loss_display_seconds as f64,
             win_w,
@@ -327,6 +376,18 @@ impl LiveDetectionPipeline {
         // 6. Attach RSI identities & queue lookups for confirmed handles
         self.resolve_tracked_identities(now_ms, social);
 
+        if collect_debug_boxes {
+            for m in &self.tracker.markers {
+                if m.status != PlateStatus::Confirmed && scan_res.debug_boxes.len() < 64 {
+                    let (pred_box, _) = m.predict_box(now_ms, &self.pipeline_settings);
+                    scan_res.debug_boxes.push(DebugCandidateBox {
+                        rect: pred_box,
+                        kind: DebugBoxKind::TentativeTrack,
+                    });
+                }
+            }
+        }
+
         // 7. Build bracket items with WhiteDuplicateRule + Green party duplicate rule
         let brackets = self.build_brackets(now_ms, social);
 
@@ -340,6 +401,15 @@ impl LiveDetectionPipeline {
             self.mining_lock = None;
             Vec::new()
         };
+
+        let mining_locked = mining_labels.first().map(|m| m.text.clone());
+        let confirmed_tracks = self
+            .tracker
+            .markers
+            .iter()
+            .filter(|m| m.status == PlateStatus::Confirmed)
+            .count();
+        let tentative_tracks = self.tracker.markers.len().saturating_sub(confirmed_tracks);
 
         let note = if now_ms < self.aberration_note_until_ms {
             Some(AberrationWatch::NOTE_TEXT.to_string())
@@ -357,15 +427,31 @@ impl LiveDetectionPipeline {
             note,
             boundary_rect: None,
             dossier_placeholder: None,
+            debug_info: None,
         };
 
         let roster = InteractiveRoster::build(&self.tracker, now_ms);
+        let stats = PipelineStats {
+            tick: self.tick_counter,
+            process_ms: process_start.elapsed().as_secs_f64() * 1000.0,
+            candidate_boxes: scan_res.candidate_boxes,
+            candidate_pairs: scan_res.candidate_pairs,
+            ocr_reads: scan_res.ocr_reads,
+            observations_accepted: scan_res.observations.len(),
+            confirmed_tracks,
+            tentative_tracks,
+            in_flight_lookups: self.in_flight_lookups.len(),
+            mining_locked,
+            last_read_sample: self.last_read_sample.clone(),
+            debug_boxes: scan_res.debug_boxes,
+        };
 
         PipelineSnapshot {
             model,
             roster,
             blank_picture: false,
             aberration: Some(self.aberration_state),
+            stats,
         }
     }
 
@@ -402,10 +488,17 @@ impl LiveDetectionPipeline {
         bgr: &BgrImage,
         now_ms: f64,
         social: &SocialConfig,
-    ) -> Vec<Observation> {
+        collect_debug_boxes: bool,
+    ) -> ScanPlateResult {
         let candidates = self.detector.find_candidates(bgr);
         if candidates.boxes.is_empty() {
-            return Vec::new();
+            return ScanPlateResult {
+                observations: Vec::new(),
+                candidate_boxes: 0,
+                candidate_pairs: 0,
+                ocr_reads: 0,
+                debug_boxes: Vec::new(),
+            };
         }
 
         let mut pair_list: Vec<(usize, usize)> = Vec::new();
@@ -413,6 +506,39 @@ impl LiveDetectionPipeline {
         pair_list.extend_from_slice(&candidates.loose_pairs);
         for cp in &candidates.crowd_pairs {
             pair_list.push((cp.top, cp.bottom));
+        }
+        let candidate_boxes = candidates.boxes.len();
+        let candidate_pairs = pair_list.len();
+
+        let mut debug_boxes = Vec::new();
+        if collect_debug_boxes {
+            let mut paired_mask = vec![false; candidates.boxes.len()];
+            for &(top_idx, bot_idx) in &pair_list {
+                if top_idx < paired_mask.len() {
+                    paired_mask[top_idx] = true;
+                }
+                if bot_idx < paired_mask.len() {
+                    paired_mask[bot_idx] = true;
+                }
+                if debug_boxes.len() < 48 {
+                    let u = candidates.boxes[top_idx].union(&candidates.boxes[bot_idx]);
+                    debug_boxes.push(DebugCandidateBox {
+                        rect: u.to_pixel_rect(),
+                        kind: DebugBoxKind::PairedCandidate,
+                    });
+                }
+            }
+            for (idx, b) in candidates.boxes.iter().enumerate() {
+                if debug_boxes.len() >= 56 {
+                    break;
+                }
+                if !paired_mask[idx] {
+                    debug_boxes.push(DebugCandidateBox {
+                        rect: b.to_pixel_rect(),
+                        kind: DebugBoxKind::Candidate,
+                    });
+                }
+            }
         }
 
         let rule = AberrationWatch::rule_for(self.aberration_state);
@@ -501,14 +627,20 @@ impl LiveDetectionPipeline {
             let cached_orgs = self.cache.get_player(&combined_text).map(|p| p.orgs);
             let is_listed =
                 PlateNameJudge::is_listed(&combined_text, cached_orgs.as_deref(), social);
-            if PlateNameJudge::classify(
+            let name_class = PlateNameJudge::classify(
                 &combined_text,
                 social,
                 &self.exclusions,
                 &self.session_exclusions,
                 is_listed,
-            ) != NameClass::Valid
-            {
+            );
+            let verdict_str = match name_class {
+                NameClass::Valid => "valid",
+                NameClass::Contact => "contact",
+                NameClass::Excluded => "excluded",
+            };
+            self.last_read_sample = Some((combined_text.clone(), verdict_str, now_ms));
+            if name_class != NameClass::Valid {
                 continue;
             }
 
@@ -552,7 +684,13 @@ impl LiveDetectionPipeline {
             }
         }
 
-        observations
+        ScanPlateResult {
+            observations,
+            candidate_boxes,
+            candidate_pairs,
+            ocr_reads: reads_done,
+            debug_boxes,
+        }
     }
 
     fn resolve_tracked_identities(&mut self, now_ms: f64, social: &SocialConfig) {

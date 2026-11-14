@@ -1,13 +1,15 @@
-use crate::state::{AppSharedState, CoordinatorCommand};
+use crate::state::{AppSharedState, CoordinatorCommand, LiveDiagnosticsSnapshot};
 use chrono::{Duration as ChronoDuration, Utc};
 use crossbeam_channel::Receiver;
-use iris_core::config::AppSettings;
-use iris_core::models::{IntRect, OverlayModel};
+use iris_core::config::{AppSettings, CaptureMethod};
+use iris_core::models::{DebugOverlayInfo, DebugStatusLevel, IntRect, OverlayModel};
 use iris_core::overlay::{
     BorderlessNoticeTracker, GameWindowRules, GameWindowState, SoftwareOverlayPainter,
     TestOverlayBuilder, TestOverlayPart, TrackingBoundary,
 };
-use iris_core::pipeline::{LiveDetectionPipeline, TimedOverlayPress, TimedOverlayRun};
+use iris_core::pipeline::{
+    LiveDetectionPipeline, PipelineStats, TimedOverlayPress, TimedOverlayRun,
+};
 use iris_platform::{
     create_frame_capturer, create_game_detector, create_hotkey_listener, create_overlay_window,
     create_tray_backend, open_folder_or_file, HotkeyAction, IpcCommand, OverlayWindowBackend,
@@ -49,7 +51,10 @@ fn run_coordinator_loop(
     let mut detector = create_game_detector();
     let mut capturer = create_frame_capturer();
     let mut hotkeys = create_hotkey_listener(&initial_settings);
-    let mut tray = match create_tray_backend(!initial_settings.overlay_disabled) {
+    let mut tray = match create_tray_backend(
+        !initial_settings.overlay_disabled,
+        initial_settings.debug_overlay_enabled,
+    ) {
         Ok(t) => Some(t),
         Err(e) => {
             tracing::warn!("System tray unavailable: {}", e);
@@ -81,6 +86,25 @@ fn run_coordinator_loop(
     let mut last_drawn_bounds = IntRect::default();
     let mut last_drawn_vis_cap = false;
     let mut last_roster_len = 0usize;
+
+    // Live pipeline & capture diagnostics
+    let mut coordinator_ticks: u64 = 0;
+    let mut rate_window_start_ms: f64 = 0.0;
+    let mut ticks_in_window: u32 = 0;
+    let mut captures_in_window: u32 = 0;
+    let mut loop_hz: f64 = 0.0;
+    let mut capture_fps: f64 = 0.0;
+    let mut frames_captured: u64 = 0;
+    let mut capture_timeouts: u64 = 0;
+    let mut capture_errors: u64 = 0;
+    let mut last_capture_ms: f64 = f64::NEG_INFINITY;
+    let mut last_capture_error: Option<(String, f64)> = None;
+    let mut last_stats = PipelineStats::default();
+    let mut last_blank_picture = false;
+    let mut heartbeat_step: u64 = 0;
+    let mut last_debug_refresh_ms: f64 = f64::NEG_INFINITY;
+    let mut cached_debug_info: Option<DebugOverlayInfo> = None;
+    let mut last_diag_publish_ms: f64 = f64::NEG_INFINITY;
 
     // Startup background checks (Hosted Config daily sync + optional release update check)
     {
@@ -115,6 +139,27 @@ fn run_coordinator_loop(
             "Overlay DISABLED"
         } else {
             "Overlay ENABLED"
+        };
+        *transient_toast = Some((msg.to_string(), now_ms + TOGGLE_TOAST_DURATION_MS));
+        shared.save_settings(false);
+    };
+
+    let apply_debug_toggle = |shared: &Arc<AppSharedState>,
+                              tray: &mut Option<Box<dyn iris_platform::TrayBackend>>,
+                              transient_toast: &mut Option<(String, f64)>,
+                              now_ms: f64| {
+        let new_debug = {
+            let mut s = shared.settings.write();
+            s.debug_overlay_enabled = !s.debug_overlay_enabled;
+            s.debug_overlay_enabled
+        };
+        if let Some(t) = tray.as_mut() {
+            t.set_debug_enabled(new_debug);
+        }
+        let msg = if new_debug {
+            "Debug HUD ON"
+        } else {
+            "Debug HUD OFF"
         };
         *transient_toast = Some((msg.to_string(), now_ms + TOGGLE_TOAST_DURATION_MS));
         shared.save_settings(false);
@@ -155,6 +200,9 @@ fn run_coordinator_loop(
                     now_ms,
                 );
             }
+            IpcCommand::ToggleDebugOverlay => {
+                apply_debug_toggle(&shared, &mut tray, &mut transient_toast, now_ms);
+            }
             IpcCommand::TimedOverlay => apply_timed(&shared, &mut timed_run, now_ms),
             IpcCommand::InteractiveOverlay => apply_interactive(&shared),
             IpcCommand::Quit => {
@@ -168,6 +216,16 @@ fn run_coordinator_loop(
     while !shared.quit_requested.load(Ordering::Relaxed) {
         let tick_start = Instant::now();
         let now_ms = now_ms_fn();
+        coordinator_ticks = coordinator_ticks.wrapping_add(1);
+        ticks_in_window += 1;
+        if now_ms - rate_window_start_ms >= 500.0 {
+            let dt_s = ((now_ms - rate_window_start_ms) / 1000.0).max(0.001);
+            loop_hz = ticks_in_window as f64 / dt_s;
+            capture_fps = captures_in_window as f64 / dt_s;
+            rate_window_start_ms = now_ms;
+            ticks_in_window = 0;
+            captures_in_window = 0;
+        }
 
         // 1. Drain IPC commands from secondary CLI invocations
         while let Some(ipc_cmd) = ipc.try_recv() {
@@ -184,6 +242,9 @@ fn run_coordinator_loop(
                         &mut transient_toast,
                         now_ms,
                     );
+                }
+                IpcCommand::ToggleDebugOverlay => {
+                    apply_debug_toggle(&shared, &mut tray, &mut transient_toast, now_ms);
                 }
                 IpcCommand::TimedOverlay => apply_timed(&shared, &mut timed_run, now_ms),
                 IpcCommand::InteractiveOverlay => apply_interactive(&shared),
@@ -215,6 +276,9 @@ fn run_coordinator_loop(
                         &mut transient_toast,
                         now_ms,
                     );
+                }
+                TrayAction::ToggleDebugOverlay => {
+                    apply_debug_toggle(&shared, &mut tray, &mut transient_toast, now_ms);
                 }
                 TrayAction::OpenLogs => {
                     let _ = open_folder_or_file(&shared.paths.logs_dir);
@@ -254,7 +318,9 @@ fn run_coordinator_loop(
                     hotkeys.update_bindings(&s);
                     if let Some(t) = tray.as_mut() {
                         t.set_overlay_enabled(!s.overlay_disabled);
+                        t.set_debug_enabled(s.debug_overlay_enabled);
                     }
+                    cached_debug_info = None;
                     if reset_capture {
                         capturer.reset();
                     }
@@ -276,6 +342,9 @@ fn run_coordinator_loop(
                         &mut transient_toast,
                         now_ms,
                     );
+                }
+                CoordinatorCommand::ToggleDebugOverlay => {
+                    apply_debug_toggle(&shared, &mut tray, &mut transient_toast, now_ms);
                 }
                 CoordinatorCommand::TimedOverlay => {
                     apply_timed(&shared, &mut timed_run, now_ms);
@@ -354,6 +423,11 @@ fn run_coordinator_loop(
             };
             let secs_left = (((until_ms - now_ms) / 1000.0).ceil() as i32).max(1);
             model.toast = Some(format!("Test Preview ({}s)", secs_left));
+            if let Some(dbg) = model.debug_info.as_mut() {
+                let step = (now_ms / 250.0) as u64;
+                dbg.heartbeat_phase = (step % 4) as u8;
+                dbg.headline = format!("PREVIEW - SCANNING (IDLE)  #{:04}", step % 10_000);
+            }
 
             if let Some(o) = overlay.as_mut() {
                 let vis_cap = settings.overlay_shown_in_capture();
@@ -376,6 +450,25 @@ fn run_coordinator_loop(
                     }
                 }
             }
+            if now_ms - last_diag_publish_ms >= 250.0 {
+                last_diag_publish_ms = now_ms;
+                publish_diagnostics(
+                    &shared,
+                    coordinator_ticks,
+                    loop_hz,
+                    capture_fps,
+                    frames_captured,
+                    capture_timeouts,
+                    capture_errors,
+                    &last_capture_error,
+                    last_blank_picture,
+                    &last_stats,
+                    &settings,
+                    overlay_currently_shown,
+                    "Test Preview Active",
+                    now_ms,
+                );
+            }
             thread::sleep(Duration::from_millis(80));
             continue;
         }
@@ -395,10 +488,14 @@ fn run_coordinator_loop(
         let show_borderless_note = now_ms < borderless_until_ms && game.focused && !game.minimized;
         let effective_overlay_active = !settings.overlay_disabled || timed_run.is_active;
         let show_toggle_toast = transient_toast.is_some() && game.focused && !game.minimized;
+        let show_debug_hud =
+            settings.debug_overlay_enabled && effective_overlay_active && game.focused && !game.minimized;
 
-        if win_state != GameWindowState::Ready && !show_borderless_note {
+        if win_state != GameWindowState::Ready && !show_borderless_note && !show_debug_hud {
             if !game.present {
                 pipeline.reset_tracking();
+                capture_fps = 0.0;
+                last_blank_picture = false;
             }
             if overlay_currently_shown {
                 if let Some(o) = overlay.as_mut() {
@@ -406,6 +503,34 @@ fn run_coordinator_loop(
                 }
                 overlay_currently_shown = false;
                 last_drawn_model = None;
+            }
+            if now_ms - last_diag_publish_ms >= 250.0 {
+                last_diag_publish_ms = now_ms;
+                let idle_status = if !game.present {
+                    "Waiting for Star Citizen"
+                } else if game.minimized {
+                    "Paused (Star Citizen Minimized)"
+                } else if win_state == GameWindowState::NotBorderless {
+                    "Star Citizen Not Borderless"
+                } else {
+                    "Paused (Star Citizen Unfocused)"
+                };
+                publish_diagnostics(
+                    &shared,
+                    coordinator_ticks,
+                    loop_hz,
+                    capture_fps,
+                    frames_captured,
+                    capture_timeouts,
+                    capture_errors,
+                    &last_capture_error,
+                    last_blank_picture,
+                    &last_stats,
+                    &settings,
+                    overlay_currently_shown,
+                    idle_status,
+                    now_ms,
+                );
             }
             thread::sleep(Duration::from_millis(120));
             continue;
@@ -419,6 +544,25 @@ fn run_coordinator_loop(
                 overlay_currently_shown = false;
                 last_drawn_model = None;
             }
+            if now_ms - last_diag_publish_ms >= 250.0 {
+                last_diag_publish_ms = now_ms;
+                publish_diagnostics(
+                    &shared,
+                    coordinator_ticks,
+                    loop_hz,
+                    0.0,
+                    frames_captured,
+                    capture_timeouts,
+                    capture_errors,
+                    &last_capture_error,
+                    last_blank_picture,
+                    &last_stats,
+                    &settings,
+                    overlay_currently_shown,
+                    "Overlay Disabled",
+                    now_ms,
+                );
+            }
             thread::sleep(Duration::from_millis(80));
             continue;
         }
@@ -429,7 +573,7 @@ fn run_coordinator_loop(
             continue;
         }
 
-        // 8. Capture & Process Live Frame (or render toast-only model if disabled / not borderless)
+        // 8. Capture & Process Live Frame (or render toast/debug model if disabled / not borderless)
         let mut model_to_draw = OverlayModel {
             window_width: target_bounds.width,
             window_height: target_bounds.height,
@@ -445,6 +589,9 @@ fn run_coordinator_loop(
                         shared.save_settings(false);
                     }
                     if let Some(frame) = maybe_frame {
+                        frames_captured = frames_captured.wrapping_add(1);
+                        captures_in_window += 1;
+                        last_capture_ms = now_ms;
                         let snap = {
                             let social_guard = shared.social.read();
                             pipeline.process_frame(&frame, &settings, &social_guard)
@@ -454,14 +601,24 @@ fn run_coordinator_loop(
                             last_roster_len = snap.roster.len();
                             *shared.live_roster.write() = snap.roster;
                         }
+                        last_stats = snap.stats;
+                        last_blank_picture = snap.blank_picture;
                         model_to_draw = snap.model;
-                    } else if let Some(prev) = &last_drawn_model {
-                        // Frame timeout / cursor-only update: keep existing HUD markers steady
-                        model_to_draw = prev.clone();
+                    } else {
+                        capture_timeouts = capture_timeouts.wrapping_add(1);
+                        if let Some(prev) = &last_drawn_model {
+                            // Frame timeout / cursor-only update: keep existing HUD markers steady
+                            model_to_draw.brackets = prev.brackets.clone();
+                            model_to_draw.panel_entries = prev.panel_entries.clone();
+                            model_to_draw.mining_labels = prev.mining_labels.clone();
+                            model_to_draw.note = prev.note.clone();
+                        }
                     }
                 }
                 Err(err) => {
                     tracing::debug!("Frame capture transient error: {}", err);
+                    capture_errors = capture_errors.wrapping_add(1);
+                    last_capture_error = Some((sanitize_ascii(&err.to_string(), 42), now_ms));
                     capturer.reset();
                 }
             }
@@ -477,6 +634,47 @@ fn run_coordinator_loop(
             }
         } else if let Some((ref msg, _)) = transient_toast {
             model_to_draw.toast = Some(msg.clone());
+        }
+
+        let active_status = compute_active_status_text(
+            win_state,
+            &last_capture_error,
+            last_capture_ms,
+            last_blank_picture,
+            &model_to_draw,
+            now_ms,
+        );
+
+        if show_debug_hud {
+            let refresh_interval = if settings.debug_show_candidates {
+                125.0
+            } else {
+                250.0
+            };
+            if cached_debug_info.is_none() || now_ms - last_debug_refresh_ms >= refresh_interval {
+                heartbeat_step = heartbeat_step.wrapping_add(1);
+                last_debug_refresh_ms = now_ms;
+                cached_debug_info = Some(build_debug_overlay_info(
+                    win_state,
+                    &settings,
+                    target_bounds,
+                    loop_hz,
+                    capture_fps,
+                    frames_captured,
+                    capture_errors,
+                    &last_capture_error,
+                    last_capture_ms,
+                    last_blank_picture,
+                    &last_stats,
+                    &model_to_draw,
+                    heartbeat_step,
+                    now_ms,
+                ));
+            }
+            model_to_draw.debug_info = cached_debug_info.clone();
+        } else {
+            cached_debug_info = None;
+            model_to_draw.debug_info = None;
         }
 
         if model_to_draw.is_empty() {
@@ -509,6 +707,26 @@ fn run_coordinator_loop(
             }
         }
 
+        if now_ms - last_diag_publish_ms >= 250.0 {
+            last_diag_publish_ms = now_ms;
+            publish_diagnostics(
+                &shared,
+                coordinator_ticks,
+                loop_hz,
+                capture_fps,
+                frames_captured,
+                capture_timeouts,
+                capture_errors,
+                &last_capture_error,
+                last_blank_picture,
+                &last_stats,
+                &settings,
+                overlay_currently_shown,
+                &active_status,
+                now_ms,
+            );
+        }
+
         // 9. Frame rate pacing
         let target_fps = if settings.nameplate_tracking_fps > AppSettings::TRACKING_FPS_HIGHEST {
             120.0
@@ -525,4 +743,261 @@ fn run_coordinator_loop(
     if let Some(mut o) = overlay {
         o.hide();
     }
+}
+
+fn sanitize_ascii(raw: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(raw.len().min(max_chars));
+    for c in raw.chars() {
+        if out.chars().count() >= max_chars {
+            break;
+        }
+        if (' '..='~').contains(&c) {
+            out.push(c);
+        } else if c.is_whitespace() {
+            out.push(' ');
+        }
+    }
+    out.trim().to_string()
+}
+
+fn capture_backend_short_name(method: CaptureMethod) -> &'static str {
+    match method {
+        CaptureMethod::DesktopDuplication => {
+            if cfg!(target_os = "linux") {
+                "PipeWire/X11"
+            } else {
+                "DXGI"
+            }
+        }
+        CaptureMethod::WindowCapture => {
+            if cfg!(target_os = "linux") {
+                "XDG Portal"
+            } else {
+                "WGC"
+            }
+        }
+    }
+}
+
+fn compute_active_status_text(
+    win_state: GameWindowState,
+    last_capture_error: &Option<(String, f64)>,
+    last_capture_ms: f64,
+    last_blank_picture: bool,
+    model_to_draw: &OverlayModel,
+    now_ms: f64,
+) -> String {
+    if win_state == GameWindowState::NotBorderless {
+        return "Not Borderless (Windowed/Fullscreen)".to_string();
+    }
+    if let Some((_, err_ms)) = last_capture_error {
+        if now_ms - *err_ms < 3_000.0 && last_capture_ms < *err_ms {
+            return "Capture Error".to_string();
+        }
+    }
+    if last_blank_picture {
+        return "Blank Black Frame".to_string();
+    }
+    if now_ms - last_capture_ms > 1_200.0 {
+        return "Scanning (Static Screen / Idle)".to_string();
+    }
+    let active_targets = model_to_draw.brackets.len() + model_to_draw.mining_labels.len();
+    if active_targets > 0 {
+        format!("Tracking ({} active)", active_targets)
+    } else {
+        "Scanning (Idle - 0 targets)".to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_debug_overlay_info(
+    win_state: GameWindowState,
+    settings: &AppSettings,
+    target_bounds: IntRect,
+    loop_hz: f64,
+    capture_fps: f64,
+    frames_captured: u64,
+    capture_errors: u64,
+    last_capture_error: &Option<(String, f64)>,
+    last_capture_ms: f64,
+    last_blank_picture: bool,
+    stats: &PipelineStats,
+    model_to_draw: &OverlayModel,
+    heartbeat_step: u64,
+    now_ms: f64,
+) -> DebugOverlayInfo {
+    let recent_err = last_capture_error
+        .as_ref()
+        .filter(|(_, err_ms)| now_ms - *err_ms < 3_000.0 && last_capture_ms < *err_ms);
+
+    let (level, status_tag) = if win_state == GameWindowState::NotBorderless {
+        (
+            DebugStatusLevel::Warning,
+            "WARN - NOT BORDERLESS".to_string(),
+        )
+    } else if recent_err.is_some() {
+        (DebugStatusLevel::Error, "ERR - CAPTURE FAILED".to_string())
+    } else if last_blank_picture {
+        (
+            DebugStatusLevel::Warning,
+            "WARN - BLANK BLACK FRAME".to_string(),
+        )
+    } else if now_ms - last_capture_ms > 1_200.0 {
+        (
+            DebugStatusLevel::Idle,
+            "LIVE - STATIC SCREEN (IDLE)".to_string(),
+        )
+    } else {
+        let active_targets = model_to_draw.brackets.len() + model_to_draw.mining_labels.len();
+        if active_targets > 0 {
+            (
+                DebugStatusLevel::Active,
+                format!("LIVE - TRACKING ({} ACTIVE)", active_targets),
+            )
+        } else {
+            (
+                DebugStatusLevel::Active,
+                "LIVE - SCANNING (0 TARGETS)".to_string(),
+            )
+        }
+    };
+
+    let headline = format!("{}  #{:04}", status_tag, heartbeat_step % 10_000);
+    let backend = capture_backend_short_name(settings.capture_method);
+
+    let line1 = format!(
+        "Loop: {:.0} Hz  |  Cap: {:.0} FPS ({} {}x{})  |  Scan: {:.1} ms",
+        loop_hz,
+        capture_fps,
+        backend,
+        target_bounds.width,
+        target_bounds.height,
+        stats.process_ms
+    );
+
+    let line2 = format!(
+        "Plates: {} box, {} pair, {} OCR  |  Tracks: {} conf, {} tent  |  RSI: {}",
+        stats.candidate_boxes,
+        stats.candidate_pairs,
+        stats.ocr_reads,
+        stats.confirmed_tracks,
+        stats.tentative_tracks,
+        stats.in_flight_lookups
+    );
+
+    let mining_txt = if settings.mining_disabled {
+        "Off".to_string()
+    } else if let Some(lbl) = &stats.mining_locked {
+        format!("Locked ({})", sanitize_ascii(lbl, 18))
+    } else {
+        "Searching".to_string()
+    };
+
+    let ocr_txt = match &stats.last_read_sample {
+        Some((sample, verdict, seen_ms)) if now_ms - *seen_ms < 20_000.0 => {
+            let age_s = ((now_ms - *seen_ms) / 1000.0).max(0.0);
+            format!(
+                "\"{}\" ({}, {:.0}s)",
+                sanitize_ascii(sample, 18),
+                verdict,
+                age_s
+            )
+        }
+        _ => "none".to_string(),
+    };
+
+    let line3 = if win_state == GameWindowState::NotBorderless {
+        "Set Options > Graphics > Window Mode = Borderless in Star Citizen".to_string()
+    } else if let Some((err_txt, err_ms)) = last_capture_error {
+        if now_ms - *err_ms < 8_000.0 {
+            format!(
+                "Cap Err: {}  |  Frames: {} ({} err)",
+                err_txt, frames_captured, capture_errors
+            )
+        } else {
+            format!(
+                "Mining: {}  |  Last OCR: {}  |  Frames: {}",
+                mining_txt, ocr_txt, frames_captured
+            )
+        }
+    } else {
+        format!(
+            "Mining: {}  |  Last OCR: {}  |  Frames: {}",
+            mining_txt, ocr_txt, frames_captured
+        )
+    };
+
+    let (candidate_boxes, scan_boundary) =
+        if settings.debug_show_candidates && win_state == GameWindowState::Ready {
+            let boundary = TrackingBoundary::from_settings(settings);
+            (
+                stats.debug_boxes.clone(),
+                Some(boundary.to_pixels(target_bounds.width as f64, target_bounds.height as f64)),
+            )
+        } else {
+            (Vec::new(), None)
+        };
+
+    DebugOverlayInfo {
+        level,
+        headline,
+        lines: vec![line1, line2, line3],
+        heartbeat_phase: (heartbeat_step % 4) as u8,
+        candidate_boxes,
+        scan_boundary,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_diagnostics(
+    shared: &Arc<AppSharedState>,
+    coordinator_ticks: u64,
+    loop_hz: f64,
+    capture_fps: f64,
+    frames_captured: u64,
+    capture_timeouts: u64,
+    capture_errors: u64,
+    last_capture_error: &Option<(String, f64)>,
+    blank_frame: bool,
+    stats: &PipelineStats,
+    settings: &AppSettings,
+    overlay_visible: bool,
+    active_status: &str,
+    now_ms: f64,
+) {
+    let mining_status = if settings.mining_disabled {
+        "Disabled".to_string()
+    } else if let Some(lbl) = &stats.mining_locked {
+        format!("Locked: {}", lbl)
+    } else {
+        "Searching".to_string()
+    };
+
+    let last_ocr_sample = stats.last_read_sample.as_ref().map(|(txt, verdict, seen_ms)| {
+        let age_s = ((now_ms - *seen_ms) / 1000.0).max(0.0);
+        format!("\"{}\" ({}, {:.0}s ago)", txt, verdict, age_s)
+    });
+
+    let snap = LiveDiagnosticsSnapshot {
+        coordinator_ticks,
+        loop_hz,
+        capture_fps,
+        last_scan_ms: stats.process_ms,
+        frames_captured,
+        capture_timeouts,
+        capture_errors,
+        last_capture_error: last_capture_error.as_ref().map(|(e, _)| e.clone()),
+        blank_frame,
+        candidate_boxes: stats.candidate_boxes,
+        candidate_pairs: stats.candidate_pairs,
+        ocr_reads: stats.ocr_reads,
+        confirmed_tracks: stats.confirmed_tracks,
+        tentative_tracks: stats.tentative_tracks,
+        in_flight_lookups: stats.in_flight_lookups,
+        mining_status,
+        last_ocr_sample,
+        overlay_visible,
+        active_status: active_status.to_string(),
+    };
+    *shared.live_diagnostics.write() = snap;
 }

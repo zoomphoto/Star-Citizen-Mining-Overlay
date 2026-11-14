@@ -22,8 +22,32 @@ pub enum CoordinatorCommand {
     ReloadExclusions,
     LookupPlayer(String),
     ToggleOverlay,
+    ToggleDebugOverlay,
     TimedOverlay,
     OpenInteractive,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LiveDiagnosticsSnapshot {
+    pub coordinator_ticks: u64,
+    pub loop_hz: f64,
+    pub capture_fps: f64,
+    pub last_scan_ms: f64,
+    pub frames_captured: u64,
+    pub capture_timeouts: u64,
+    pub capture_errors: u64,
+    pub last_capture_error: Option<String>,
+    pub blank_frame: bool,
+    pub candidate_boxes: usize,
+    pub candidate_pairs: usize,
+    pub ocr_reads: usize,
+    pub confirmed_tracks: usize,
+    pub tentative_tracks: usize,
+    pub in_flight_lookups: usize,
+    pub mining_status: String,
+    pub last_ocr_sample: Option<String>,
+    pub overlay_visible: bool,
+    pub active_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +71,7 @@ pub struct AppSharedState {
     pub refresh_in_progress: AtomicBool,
     pub last_game_window: RwLock<GameWindowInfo>,
     pub live_roster: RwLock<Vec<RosterEntry>>,
+    pub live_diagnostics: RwLock<LiveDiagnosticsSnapshot>,
     pub status_banner: RwLock<Option<StatusMessage>>,
     pub update_available: RwLock<Option<(String, String)>>,
     pub coordinator_tx: Sender<CoordinatorCommand>,
@@ -79,6 +104,7 @@ impl AppSharedState {
             refresh_in_progress: AtomicBool::new(false),
             last_game_window: RwLock::new(GameWindowInfo::default()),
             live_roster: RwLock::new(Vec::new()),
+            live_diagnostics: RwLock::new(LiveDiagnosticsSnapshot::default()),
             status_banner: RwLock::new(None),
             update_available: RwLock::new(None),
             coordinator_tx,

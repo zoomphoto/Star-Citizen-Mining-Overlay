@@ -32,9 +32,11 @@ const ID_TOGGLE: usize = 1002;
 const ID_LOGS: usize = 1003;
 const ID_CONFIG: usize = 1004;
 const ID_QUIT: usize = 1005;
+const ID_DEBUG: usize = 1006;
 
 struct TrayThreadShared {
     overlay_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
     tx: Sender<TrayAction>,
     icon_on: HICON,
     icon_off: HICON,
@@ -48,16 +50,19 @@ static TRAY_SHARED: OnceLock<TrayThreadShared> = OnceLock::new();
 pub struct Win32TrayBackend {
     hwnd: isize,
     overlay_enabled: Arc<AtomicBool>,
+    debug_enabled: Arc<AtomicBool>,
     rx: Receiver<TrayAction>,
 }
 
 impl Win32TrayBackend {
-    pub fn new(overlay_enabled: bool) -> anyhow::Result<Self> {
+    pub fn new(overlay_enabled: bool, debug_enabled: bool) -> anyhow::Result<Self> {
         let enabled_flag = Arc::new(AtomicBool::new(overlay_enabled));
+        let debug_flag = Arc::new(AtomicBool::new(debug_enabled));
         let (tx, rx) = unbounded();
         let (hwnd_tx, hwnd_rx) = crossbeam_channel::bounded::<anyhow::Result<isize>>(1);
 
         let flag_clone = Arc::clone(&enabled_flag);
+        let debug_clone = Arc::clone(&debug_flag);
         thread::Builder::new()
             .name("sc-overlay-win32-tray".to_string())
             .spawn(move || unsafe {
@@ -66,6 +71,7 @@ impl Win32TrayBackend {
 
                 let _ = TRAY_SHARED.set(TrayThreadShared {
                     overlay_enabled: Arc::clone(&flag_clone),
+                    debug_enabled: Arc::clone(&debug_clone),
                     tx,
                     icon_on,
                     icon_off,
@@ -137,6 +143,7 @@ impl Win32TrayBackend {
         Ok(Self {
             hwnd,
             overlay_enabled: enabled_flag,
+            debug_enabled: debug_flag,
             rx,
         })
     }
@@ -153,6 +160,10 @@ impl TrayBackend for Win32TrayBackend {
                 LPARAM(0),
             );
         }
+    }
+
+    fn set_debug_enabled(&mut self, enabled: bool) {
+        self.debug_enabled.store(enabled, Ordering::Relaxed);
     }
 
     fn try_recv(&self) -> Option<TrayAction> {
@@ -247,15 +258,23 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
     } else {
         "Enable Overlay\0"
     };
+    let debug_on = shared.debug_enabled.load(Ordering::Relaxed);
+    let debug_label = if debug_on {
+        "Hide Debug HUD\0"
+    } else {
+        "Show Debug HUD\0"
+    };
 
     let w_settings: Vec<u16> = "Settings…\0".encode_utf16().collect();
     let w_toggle: Vec<u16> = toggle_label.encode_utf16().collect();
+    let w_debug: Vec<u16> = debug_label.encode_utf16().collect();
     let w_logs: Vec<u16> = "Open log folder\0".encode_utf16().collect();
     let w_cfg: Vec<u16> = "Open config location\0".encode_utf16().collect();
     let w_quit: Vec<u16> = "Quit\0".encode_utf16().collect();
 
     let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, PCWSTR(w_settings.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, PCWSTR(w_toggle.as_ptr()));
+    let _ = AppendMenuW(menu, MF_STRING, ID_DEBUG, PCWSTR(w_debug.as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_LOGS, PCWSTR(w_logs.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, ID_CONFIG, PCWSTR(w_cfg.as_ptr()));
@@ -283,6 +302,9 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
         }
         ID_TOGGLE => {
             let _ = shared.tx.send(TrayAction::ToggleOverlay);
+        }
+        ID_DEBUG => {
+            let _ = shared.tx.send(TrayAction::ToggleDebugOverlay);
         }
         ID_LOGS => {
             let _ = shared.tx.send(TrayAction::OpenLogs);

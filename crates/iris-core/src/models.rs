@@ -337,6 +337,48 @@ pub struct MiningLabelItem {
     pub back_colour: Bgr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DebugStatusLevel {
+    Active,
+    Idle,
+    Warning,
+    Error,
+}
+
+impl DebugStatusLevel {
+    pub const fn rgb(&self) -> (u8, u8, u8) {
+        match self {
+            DebugStatusLevel::Active => (0x2E, 0xE6, 0x5A),
+            DebugStatusLevel::Idle => (0x00, 0xE5, 0xFF),
+            DebugStatusLevel::Warning => (0xFF, 0x95, 0x00),
+            DebugStatusLevel::Error => (0xFF, 0x3B, 0x30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DebugBoxKind {
+    Candidate,
+    PairedCandidate,
+    TentativeTrack,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DebugCandidateBox {
+    pub rect: PixelRect,
+    pub kind: DebugBoxKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DebugOverlayInfo {
+    pub level: DebugStatusLevel,
+    pub headline: String,
+    pub lines: Vec<String>,
+    pub heartbeat_phase: u8,
+    pub candidate_boxes: Vec<DebugCandidateBox>,
+    pub scan_boundary: Option<PixelRect>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct OverlayModel {
     pub window_width: i32,
@@ -348,6 +390,7 @@ pub struct OverlayModel {
     pub note: Option<String>,
     pub boundary_rect: Option<PixelRect>,
     pub dossier_placeholder: Option<PixelRect>,
+    pub debug_info: Option<DebugOverlayInfo>,
 }
 
 impl OverlayModel {
@@ -359,5 +402,6 @@ impl OverlayModel {
             && self.note.is_none()
             && self.boundary_rect.is_none()
             && self.dossier_placeholder.is_none()
+            && self.debug_info.is_none()
     }
 }

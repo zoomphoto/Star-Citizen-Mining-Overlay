@@ -32,3 +32,5 @@ hotkey_interactive_overlay = "Shift+0"
 timed_overlay_seconds = 10
 mining_disabled = false
 mining_label_zoom_percent = 150
+debug_overlay_enabled = false
+debug_show_candidates = false

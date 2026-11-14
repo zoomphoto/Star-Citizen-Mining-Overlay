@@ -4,7 +4,7 @@ pub mod tracker;
 pub mod watches;
 
 pub use hungarian::Hungarian;
-pub use service::{CapturedFrame, LiveDetectionPipeline, PipelineSnapshot};
+pub use service::{CapturedFrame, LiveDetectionPipeline, PipelineSnapshot, PipelineStats};
 pub use tracker::{
     EndedMarker, InteractiveRoster, LineFix, LineSubPixel, MarkerTracker, NameClass, Observation,
     PlateNameJudge, PlateStatus, RosterEntry, TrackSample, TrackedMarker,

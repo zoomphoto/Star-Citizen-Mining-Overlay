@@ -126,6 +126,20 @@ impl SettingsWindowState {
             };
             ui.add_space(8.0);
             ui.label(RichText::new(status_txt).size(12.5).color(status_col));
+            let diag_ticks = shared.live_diagnostics.read().coordinator_ticks;
+            let spin = match (diag_ticks / 2) % 4 {
+                0 => "◐",
+                1 => "◓",
+                2 => "◑",
+                _ => "◒",
+            };
+            ui.label(
+                RichText::new(format!("{} #{:04}", spin, diag_ticks % 10_000))
+                    .monospace()
+                    .size(11.5)
+                    .color(p.muted),
+            )
+            .on_hover_text("Live background coordinator heartbeat (increments continuously while running)");
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
@@ -145,6 +159,19 @@ impl SettingsWindowState {
                     let _ = shared
                         .coordinator_tx
                         .send(CoordinatorCommand::OpenInteractive);
+                }
+
+                let mut debug_hud = shared.settings.read().debug_overlay_enabled;
+                if ui
+                    .checkbox(&mut debug_hud, "Debug HUD")
+                    .on_hover_text(
+                        "Show live heartbeat, capture FPS, scan latency, and detector counters on the overlay",
+                    )
+                    .changed()
+                {
+                    let _ = shared
+                        .coordinator_tx
+                        .send(CoordinatorCommand::ToggleDebugOverlay);
                 }
 
                 let mut overlay_enabled = !shared.settings.read().overlay_disabled;
@@ -1200,6 +1227,132 @@ impl SettingsWindowState {
                             changed = true;
                         }
                     });
+                });
+
+                ui.add_space(10.0);
+
+                // 3b. Overlay Debug HUD & Live Pipeline Diagnostics
+                Self::section_card(ui, p, "OVERLAY DEBUG HUD & LIVE DIAGNOSTICS", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .checkbox(
+                                &mut s.debug_overlay_enabled,
+                                "Show Debug / Heartbeat HUD on Overlay",
+                            )
+                            .on_hover_text(
+                                "Renders a compact top-left status card with a live pulsing heartbeat, capture FPS, scan time, and plate/mining counters even when 0 targets are on screen",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(8.0);
+                        if ui
+                            .add_enabled(
+                                s.debug_overlay_enabled,
+                                egui::Checkbox::new(
+                                    &mut s.debug_show_candidates,
+                                    "Outline raw candidate boxes & scan boundary",
+                                ),
+                            )
+                            .on_hover_text(
+                                "Draws cyan boxes around raw text candidates, yellow around paired name+distance candidates, and magenta around tentative tracks",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(8.0);
+                        if ui
+                            .button("👁 Preview Debug HUD (15s)")
+                            .on_hover_text(
+                                "Preview the live ticking Debug HUD on your desktop right now (even if Star Citizen is closed)",
+                            )
+                            .clicked()
+                        {
+                            let _ = shared
+                                .coordinator_tx
+                                .send(CoordinatorCommand::ShowTestOverlay(TestOverlayPart::DebugHud));
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    let diag = shared.live_diagnostics.read().clone();
+                    egui::Frame::none()
+                        .fill(p.bg)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .rounding(Rounding::same(5.0))
+                        .inner_margin(Margin::symmetric(10.0, 7.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let status_txt = if diag.active_status.is_empty() {
+                                "Initializing…"
+                            } else {
+                                diag.active_status.as_str()
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("Pipeline Status:").size(12.0).color(p.muted));
+                                ui.label(
+                                    RichText::new(status_txt)
+                                        .strong()
+                                        .size(12.0)
+                                        .color(if diag.blank_frame || diag.capture_errors > 0 {
+                                            OverlayColor::Orange.rgb().into_color32()
+                                        } else {
+                                            p.accent
+                                        }),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "•  Overlay: {}  •  Loop: {:.0} Hz (tick #{})  •  Capture: {:.0} FPS ({} frames, {} idle, {} err)  •  Scan: {:.1} ms",
+                                        if diag.overlay_visible { "Shown" } else { "Hidden" },
+                                        diag.loop_hz,
+                                        diag.coordinator_ticks,
+                                        diag.capture_fps,
+                                        diag.frames_captured,
+                                        diag.capture_timeouts,
+                                        diag.capture_errors,
+                                        diag.last_scan_ms,
+                                    ))
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(p.text),
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                let last_ocr = diag.last_ocr_sample.as_deref().unwrap_or("none");
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Detector: {} boxes, {} pairs, {} OCR  •  Tracks: {} confirmed / {} tentative  •  RSI Queue: {}  •  Mining: {}  •  Last OCR: {}",
+                                        diag.candidate_boxes,
+                                        diag.candidate_pairs,
+                                        diag.ocr_reads,
+                                        diag.confirmed_tracks,
+                                        diag.tentative_tracks,
+                                        diag.in_flight_lookups,
+                                        if diag.mining_status.is_empty() {
+                                            "—"
+                                        } else {
+                                            diag.mining_status.as_str()
+                                        },
+                                        last_ocr,
+                                    ))
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(p.muted),
+                                );
+                            });
+                            if let Some(err) = &diag.last_capture_error {
+                                ui.label(
+                                    RichText::new(format!("Last Capture Error: {}", err))
+                                        .monospace()
+                                        .size(11.5)
+                                        .color(p.danger),
+                                );
+                            }
+                        });
                 });
 
                 ui.add_space(10.0);

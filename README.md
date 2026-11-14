@@ -105,6 +105,7 @@ distrobox enter fedora-dev -- bash -lc "sudo dnf install -y rust cargo gcc pkgco
 | Action | Default Hotkey | CLI Flag (signals running instance via IPC) |
 | :--- | :--- | :--- |
 | Toggle Overlay On / Off | `Shift+F12` | `sc-overlay --toggle` |
+| Toggle Live Debug / Heartbeat HUD | *(Settings / Tray)* | `sc-overlay --debug` |
 | Timed Overlay Peek (when disabled) | `Tab` | `sc-overlay --timed` |
 | Interactive Citizen Dossier & Notes | `Shift+0` | `sc-overlay --interactive` |
 | Open / Focus Settings Window | *(Tray click)* | `sc-overlay --settings` |
