@@ -199,3 +199,4 @@ fn vk_to_hotkey_name(vk: u32) -> Option<String> {
         _ => None,
     }
 }
+

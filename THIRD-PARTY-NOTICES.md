@@ -32,3 +32,4 @@ SC Overlay is a cross-platform Rust implementation inspired by [Niteb1rd/IRIS](h
 ## 3. Star Citizen Trademark Disclaimer
 
 This is an unofficial Star Citizen fan project, not affiliated with the Cloud Imperium group of companies. All content on this site or repository not authored by its host or users are property of their respective owners. *Star Citizen®*, *Roberts Space Industries®*, and *Cloud Imperium®* are registered trademarks of Cloud Imperium Rights LLC.
+

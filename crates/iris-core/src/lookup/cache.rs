@@ -655,3 +655,4 @@ fn split_activities(text: &str) -> Vec<String> {
             .collect()
     }
 }
+

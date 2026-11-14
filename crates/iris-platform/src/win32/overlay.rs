@@ -304,3 +304,4 @@ impl Drop for Win32OverlayWindow {
         let _ = self.tx.send(OverlayCmd::Shutdown);
     }
 }
+

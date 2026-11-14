@@ -9,3 +9,4 @@ pub use game_window::Win32GameDetector;
 pub use hotkeys::Win32HotkeyListener;
 pub use overlay::Win32OverlayWindow;
 pub use tray::Win32TrayBackend;
+

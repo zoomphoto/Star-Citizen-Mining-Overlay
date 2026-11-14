@@ -94,3 +94,4 @@ Quick Start on Bazzite (KDE Plasma Wayland / GNOME / LUG Helper / Lutris / Steam
        sudo usermod -aG input "\$USER"   # takes effect after re-login
 
 EOF
+

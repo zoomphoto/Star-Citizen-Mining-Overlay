@@ -642,3 +642,4 @@ impl MiningLabelState {
         changed
     }
 }
+

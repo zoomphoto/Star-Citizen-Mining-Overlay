@@ -311,3 +311,4 @@ impl GameWindowDetector for LinuxGameDetector {
         GameWindowInfo::default()
     }
 }
+

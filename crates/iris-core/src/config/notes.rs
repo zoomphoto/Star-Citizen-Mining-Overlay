@@ -346,3 +346,4 @@ fn is_record(text: Option<&str>) -> bool {
         _ => false,
     }
 }
+

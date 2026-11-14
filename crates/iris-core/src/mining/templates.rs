@@ -324,3 +324,4 @@ impl DigitTemplates {
         err(a) > err(b)
     }
 }
+

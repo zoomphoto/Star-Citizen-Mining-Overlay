@@ -28,3 +28,4 @@ Exec=sc-overlay --interactive
 [Desktop Action Quit]
 Name=Quit SC Overlay
 Exec=sc-overlay --quit
+

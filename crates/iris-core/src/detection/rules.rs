@@ -787,3 +787,4 @@ impl UnderscoreHyphenRule {
         chars.into_iter().collect()
     }
 }
+

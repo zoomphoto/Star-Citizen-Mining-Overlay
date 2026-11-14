@@ -361,3 +361,4 @@ fn has_shifted_layers(red: &GrayImage, blue: &GrayImage) -> bool {
         && px >= NameplateFeatures::LAYER_SHIFT_MIN_PX
         && px <= NameplateFeatures::LAYER_SHIFT_MAX_PX
 }
+

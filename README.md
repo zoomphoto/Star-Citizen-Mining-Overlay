@@ -138,3 +138,4 @@ All configuration files (`social-config.txt`, `settings.txt`, `mining.txt`, `exc
 
 Licensed under **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)** — see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 Special thanks to **Niteb1rd** and contributors of [IRIS](https://github.com/Niteb1rd/IRIS) for the original design, neural OCR weights, and Star Citizen mining signature tables.
+

@@ -230,3 +230,4 @@ fn finalize_log_softmax(logits: &mut [f64], log_probs: &mut [f64]) {
         log_probs[j] = (v / sum).clamp(LetterModel::MIN_PROBABILITY, 1.0).ln();
     }
 }
+

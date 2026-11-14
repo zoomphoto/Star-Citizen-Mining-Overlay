@@ -9,3 +9,4 @@ pub use game_window::LinuxGameDetector;
 pub use hotkeys::LinuxHotkeyListener;
 pub use overlay::LinuxOverlayWindow;
 pub use tray::LinuxTrayBackend;
+

@@ -1094,3 +1094,4 @@ impl TestOverlayBuilder {
         PixelRect::new(x, y, box_w, box_h)
     }
 }
+

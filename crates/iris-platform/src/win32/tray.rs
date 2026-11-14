@@ -352,3 +352,4 @@ unsafe fn decode_ico_to_hicon(ico_bytes: &[u8]) -> Option<HICON> {
     }
     hicon
 }
+

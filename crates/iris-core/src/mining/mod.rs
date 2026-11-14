@@ -10,3 +10,4 @@ pub use state::{
 };
 pub use table::{MiningResource, MiningTable, MiningTableSource};
 pub use templates::DigitTemplates;
+

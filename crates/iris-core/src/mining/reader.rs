@@ -1291,3 +1291,4 @@ impl MiningSignalReader {
         (text, Bgr::new(back_b[mid], back_g[mid], back_r[mid]))
     }
 }
+

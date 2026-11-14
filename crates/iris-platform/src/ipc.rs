@@ -137,3 +137,4 @@ impl Drop for SingleInstanceIpc {
         let _ = fs::remove_file(&self.addr_file);
     }
 }
+
