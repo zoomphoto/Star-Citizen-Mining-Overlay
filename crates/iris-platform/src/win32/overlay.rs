@@ -1,8 +1,7 @@
 use crate::OverlayWindowBackend;
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use iris_core::models::IntRect;
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::thread;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
@@ -24,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 enum OverlayCmd {
     Present {
         bounds: IntRect,
-        pixels: Arc<Vec<u8>>,
+        pixels: Vec<u8>,
         visible_in_capture: bool,
     },
     Hide,
@@ -33,30 +32,39 @@ enum OverlayCmd {
 
 pub struct Win32OverlayWindow {
     tx: Sender<OverlayCmd>,
+    free_rx: Receiver<Vec<u8>>,
+    free_tx: Sender<Vec<u8>>,
 }
 
 impl Win32OverlayWindow {
     pub fn new() -> anyhow::Result<Self> {
         let (tx, rx) = bounded::<OverlayCmd>(2);
+        let (free_tx, free_rx) = bounded::<Vec<u8>>(3);
+        let thread_free_tx = free_tx.clone();
         let (ready_tx, ready_rx) = bounded::<anyhow::Result<()>>(1);
 
         thread::Builder::new()
             .name("sc-overlay-win32-layer".to_string())
             .spawn(move || {
-                if let Err(e) = Self::run_window_thread(rx, ready_tx) {
+                if let Err(e) = Self::run_window_thread(rx, thread_free_tx, ready_tx) {
                     tracing::error!("Win32 overlay thread failed: {:#}", e);
                 }
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { tx }),
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                free_rx,
+                free_tx,
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => anyhow::bail!("Win32 overlay thread exited before initialization"),
         }
     }
 
     fn run_window_thread(
-        rx: crossbeam_channel::Receiver<OverlayCmd>,
+        rx: Receiver<OverlayCmd>,
+        free_tx: Sender<Vec<u8>>,
         ready_tx: Sender<anyhow::Result<()>>,
     ) -> anyhow::Result<()> {
         unsafe {
@@ -110,6 +118,7 @@ impl Win32OverlayWindow {
             let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
             let mut current_excluded = true;
             let mut visible = false;
+            let mut last_bounds: Option<IntRect> = None;
 
             let mut dib_w = 0i32;
             let mut dib_h = 0i32;
@@ -131,6 +140,9 @@ impl Win32OverlayWindow {
                     break;
                 };
                 while let Ok(newer) = rx.try_recv() {
+                    if let OverlayCmd::Present { pixels, .. } = cmd {
+                        let _ = free_tx.try_send(pixels);
+                    }
                     if matches!(newer, OverlayCmd::Shutdown) {
                         cmd = OverlayCmd::Shutdown;
                         break;
@@ -152,6 +164,7 @@ impl Win32OverlayWindow {
                         visible_in_capture,
                     } => {
                         if bounds.width <= 0 || bounds.height <= 0 {
+                            let _ = free_tx.try_send(pixels);
                             if visible {
                                 let _ = ShowWindow(hwnd, SW_HIDE);
                                 visible = false;
@@ -160,6 +173,7 @@ impl Win32OverlayWindow {
                         }
                         let expected_len = (bounds.width as usize) * (bounds.height as usize) * 4;
                         if pixels.len() < expected_len {
+                            let _ = free_tx.try_send(pixels);
                             continue;
                         }
 
@@ -247,21 +261,26 @@ impl Win32OverlayWindow {
                                 ULW_ALPHA,
                             );
 
+                            let was_visible = visible;
                             if !visible {
                                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                                 visible = true;
                             }
-                            let _ = SetWindowPos(
-                                hwnd,
-                                HWND_TOPMOST,
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                            );
+                            if !was_visible || last_bounds != Some(bounds) {
+                                last_bounds = Some(bounds);
+                                let _ = SetWindowPos(
+                                    hwnd,
+                                    HWND_TOPMOST,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                                );
+                            }
                         }
 
+                        let _ = free_tx.try_send(pixels);
                         ReleaseDC(None, screen_dc);
                     }
                 }
@@ -286,11 +305,18 @@ impl OverlayWindowBackend for Win32OverlayWindow {
         bgra_premul: &[u8],
         visible_in_capture: bool,
     ) -> anyhow::Result<()> {
-        let _ = self.tx.try_send(OverlayCmd::Present {
-            bounds,
-            pixels: Arc::new(bgra_premul.to_vec()),
-            visible_in_capture,
-        });
+        let mut buf = self.free_rx.try_recv().unwrap_or_default();
+        buf.resize(bgra_premul.len(), 0);
+        buf.copy_from_slice(bgra_premul);
+        if let Err(crossbeam_channel::TrySendError::Full(OverlayCmd::Present { pixels, .. })) =
+            self.tx.try_send(OverlayCmd::Present {
+                bounds,
+                pixels: buf,
+                visible_in_capture,
+            })
+        {
+            let _ = self.free_tx.try_send(pixels);
+        }
         Ok(())
     }
 

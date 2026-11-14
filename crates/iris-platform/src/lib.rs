@@ -74,6 +74,9 @@ pub trait FrameCapturer: Send {
     ) -> anyhow::Result<(Option<CapturedFrame>, bool)>;
 
     fn reset(&mut self);
+
+    /// Returns a processed frame's backing buffer to the capturer so subsequent frames reuse warm pages.
+    fn recycle_frame(&mut self, _frame: CapturedFrame) {}
 }
 
 pub trait OverlayWindowBackend: Send {

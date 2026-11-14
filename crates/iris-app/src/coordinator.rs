@@ -77,6 +77,9 @@ fn run_coordinator_loop(
     let mut transient_toast: Option<(String, f64)> = None;
     let mut test_overlay: Option<(TestOverlayPart, f64)> = None;
     let mut overlay_currently_shown = false;
+    let mut last_drawn_model: Option<OverlayModel> = None;
+    let mut last_drawn_bounds = IntRect::default();
+    let mut last_drawn_vis_cap = false;
     let mut last_roster_len = 0usize;
 
     // Startup background checks (Hosted Config daily sync + optional release update check)
@@ -305,7 +308,6 @@ fn run_coordinator_loop(
         *shared.last_game_window.write() = game.clone();
 
         let mut settings = shared.settings.read().clone();
-        let social = shared.social.read().clone();
         let interactive_open = shared.interactive_open.load(Ordering::Relaxed);
 
         // Retry creating overlay window lazily if display server wasn't ready earlier
@@ -322,6 +324,7 @@ fn run_coordinator_loop(
                     o.hide();
                 }
                 overlay_currently_shown = false;
+                last_drawn_model = None;
             }
             thread::sleep(Duration::from_millis(50));
             continue;
@@ -338,28 +341,39 @@ fn run_coordinator_loop(
             };
 
             let boundary = TrackingBoundary::from_settings(&settings);
-            let mut model = TestOverlayBuilder::build(
-                &social,
-                target_bounds.width as f64,
-                target_bounds.height as f64,
-                Some(boundary),
-                part,
-                Some(&settings),
-            );
+            let mut model = {
+                let social_guard = shared.social.read();
+                TestOverlayBuilder::build(
+                    &social_guard,
+                    target_bounds.width as f64,
+                    target_bounds.height as f64,
+                    Some(boundary),
+                    part,
+                    Some(&settings),
+                )
+            };
             let secs_left = (((until_ms - now_ms) / 1000.0).ceil() as i32).max(1);
             model.toast = Some(format!("Test Preview ({}s)", secs_left));
 
             if let Some(o) = overlay.as_mut() {
-                let bgra = painter.paint(
-                    &model,
-                    &settings,
-                    target_bounds.width as u32,
-                    target_bounds.height as u32,
-                );
-                if o.present(target_bounds, &bgra, settings.overlay_shown_in_capture())
-                    .is_ok()
-                {
-                    overlay_currently_shown = true;
+                let vis_cap = settings.overlay_shown_in_capture();
+                let unchanged = overlay_currently_shown
+                    && last_drawn_bounds == target_bounds
+                    && last_drawn_vis_cap == vis_cap
+                    && last_drawn_model.as_ref() == Some(&model);
+                if !unchanged {
+                    let bgra = painter.paint_slice(
+                        &model,
+                        &settings,
+                        target_bounds.width as u32,
+                        target_bounds.height as u32,
+                    );
+                    if o.present(target_bounds, bgra, vis_cap).is_ok() {
+                        overlay_currently_shown = true;
+                        last_drawn_bounds = target_bounds;
+                        last_drawn_vis_cap = vis_cap;
+                        last_drawn_model = Some(model);
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(80));
@@ -391,6 +405,7 @@ fn run_coordinator_loop(
                     o.hide();
                 }
                 overlay_currently_shown = false;
+                last_drawn_model = None;
             }
             thread::sleep(Duration::from_millis(120));
             continue;
@@ -402,6 +417,7 @@ fn run_coordinator_loop(
                     o.hide();
                 }
                 overlay_currently_shown = false;
+                last_drawn_model = None;
             }
             thread::sleep(Duration::from_millis(80));
             continue;
@@ -429,14 +445,19 @@ fn run_coordinator_loop(
                         shared.save_settings(false);
                     }
                     if let Some(frame) = maybe_frame {
-                        let snap = pipeline.process_frame(&frame, &settings, &social);
-                        if snap.roster.len() != last_roster_len {
+                        let snap = {
+                            let social_guard = shared.social.read();
+                            pipeline.process_frame(&frame, &settings, &social_guard)
+                        };
+                        capturer.recycle_frame(frame);
+                        if !snap.roster.is_empty() || last_roster_len != 0 {
                             last_roster_len = snap.roster.len();
-                            *shared.live_roster.write() = snap.roster;
-                        } else {
                             *shared.live_roster.write() = snap.roster;
                         }
                         model_to_draw = snap.model;
+                    } else if let Some(prev) = &last_drawn_model {
+                        // Frame timeout / cursor-only update: keep existing HUD markers steady
+                        model_to_draw = prev.clone();
                     }
                 }
                 Err(err) => {
@@ -464,18 +485,27 @@ fn run_coordinator_loop(
                     o.hide();
                 }
                 overlay_currently_shown = false;
+                last_drawn_model = None;
             }
         } else if let Some(o) = overlay.as_mut() {
-            let bgra = painter.paint(
-                &model_to_draw,
-                &settings,
-                target_bounds.width as u32,
-                target_bounds.height as u32,
-            );
-            if o.present(target_bounds, &bgra, settings.overlay_shown_in_capture())
-                .is_ok()
-            {
-                overlay_currently_shown = true;
+            let vis_cap = settings.overlay_shown_in_capture();
+            let unchanged = overlay_currently_shown
+                && last_drawn_bounds == target_bounds
+                && last_drawn_vis_cap == vis_cap
+                && last_drawn_model.as_ref() == Some(&model_to_draw);
+            if !unchanged {
+                let bgra = painter.paint_slice(
+                    &model_to_draw,
+                    &settings,
+                    target_bounds.width as u32,
+                    target_bounds.height as u32,
+                );
+                if o.present(target_bounds, bgra, vis_cap).is_ok() {
+                    overlay_currently_shown = true;
+                    last_drawn_bounds = target_bounds;
+                    last_drawn_vis_cap = vis_cap;
+                    last_drawn_model = Some(model_to_draw);
+                }
             }
         }
 

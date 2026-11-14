@@ -57,7 +57,20 @@ impl CapturedFrame {
         bgra: &[u8],
         captured_ms: f64,
     ) -> Self {
-        let mut data = vec![0u8; width * height * 3];
+        Self::from_bgra8_with_buf(width, height, stride_bytes, bgra, captured_ms, Vec::new())
+    }
+
+    /// Converts a BGRA8 capture buffer into a `CapturedFrame` reusing `mut data` to avoid OS `VirtualAlloc`/`mmap` churn.
+    pub fn from_bgra8_with_buf(
+        width: usize,
+        height: usize,
+        stride_bytes: usize,
+        bgra: &[u8],
+        captured_ms: f64,
+        mut data: Vec<u8>,
+    ) -> Self {
+        let total = width * height * 3;
+        data.resize(total, 0);
         let row_bytes = width * 4;
         let stride = stride_bytes.max(row_bytes);
         for y in 0..height {
@@ -67,12 +80,13 @@ impl CapturedFrame {
             }
             let src_row = &bgra[src_start..src_start + row_bytes];
             let dst_row = &mut data[y * width * 3..(y + 1) * width * 3];
-            for x in 0..width {
-                let s = x * 4;
-                let d = x * 3;
-                dst_row[d] = src_row[s];
-                dst_row[d + 1] = src_row[s + 1];
-                dst_row[d + 2] = src_row[s + 2];
+            for (src_px, dst_px) in src_row
+                .chunks_exact(4)
+                .zip(dst_row.chunks_exact_mut(3))
+            {
+                dst_px[0] = src_px[0];
+                dst_px[1] = src_px[1];
+                dst_px[2] = src_px[2];
             }
         }
         Self::from_bgr8(width, height, data, captured_ms)

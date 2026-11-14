@@ -340,6 +340,14 @@ pub struct NameplateDetector {
 
     mask: GrayImage,
     kept: GrayImage,
+    region_buf: BgrImage,
+    ch_b: GrayImage,
+    ch_g: GrayImage,
+    ch_r: GrayImage,
+    ch_val: GrayImage,
+    cw_mask: GrayImage,
+    r_mask: GrayImage,
+    g_mask: GrayImage,
     mask_labels: Vec<i32>,
     mask_stats: Vec<ComponentStats>,
     solid: Vec<bool>,
@@ -363,6 +371,14 @@ impl NameplateDetector {
             hat_limits,
             mask: GrayImage::default(),
             kept: GrayImage::default(),
+            region_buf: BgrImage::default(),
+            ch_b: GrayImage::default(),
+            ch_g: GrayImage::default(),
+            ch_r: GrayImage::default(),
+            ch_val: GrayImage::default(),
+            cw_mask: GrayImage::default(),
+            r_mask: GrayImage::default(),
+            g_mask: GrayImage::default(),
             mask_labels: Vec::new(),
             mask_stats: Vec::new(),
             solid: Vec::new(),
@@ -442,8 +458,10 @@ impl NameplateDetector {
         let px0 = (x0 - pad).max(0);
         let px1 = (x1 + pad).min(width);
 
-        let region = bgr.crop(IntRect::new(px0, y0, px1 - px0, y1 - y0));
+        let mut region = std::mem::take(&mut self.region_buf);
+        bgr.crop_into(IntRect::new(px0, y0, px1 - px0, y1 - y0), &mut region);
         self.build_color_mask(&region, scale_height);
+        self.region_buf = region;
         self.last_mask_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         let mut narrow_shapes = Vec::new();
@@ -769,16 +787,22 @@ impl NameplateDetector {
 
     fn build_color_mask(&mut self, region: &BgrImage, scale_height: i32) {
         let tophat = self.scaled_odd(scale_height, self.settings.top_hat_kernel_px);
-        let (blue, green, red) = region.split_channels();
+        let mut blue = std::mem::take(&mut self.ch_b);
+        let mut green = std::mem::take(&mut self.ch_g);
+        let mut red = std::mem::take(&mut self.ch_r);
+        region.split_channels_into(&mut blue, &mut green, &mut red);
         let w = region.width;
         let h = region.height;
         let n = w * h;
 
-        let mut value = GrayImage::new(w, h);
+        let mut value = std::mem::take(&mut self.ch_val);
+        value.ensure_size(w, h);
         if self.settings.white_any_tint || self.settings.contrast_mask {
             for i in 0..n {
                 value.data[i] = blue.data[i].max(green.data[i]).max(red.data[i]);
             }
+        } else {
+            value.data[..n].fill(0);
         }
 
         let bright_info = if self.settings.contrast_mask {
@@ -788,7 +812,8 @@ impl NameplateDetector {
         };
         let bright_rect = bright_info.as_ref().map(|(r, _, _)| *r);
 
-        let mut cyan_white = GrayImage::new(w, h);
+        let mut cyan_white = std::mem::take(&mut self.cw_mask);
+        cyan_white.ensure_size(w, h);
         let mut value_hat_cache: Option<(IntRect, GrayImage)> = None;
 
         if self.settings.white_any_tint {
@@ -819,7 +844,8 @@ impl NameplateDetector {
             );
         }
 
-        let mut red_mask = GrayImage::new(w, h);
+        let mut red_mask = std::mem::take(&mut self.r_mask);
+        red_mask.ensure_size(w, h);
         let r_min = self.settings.red_min as u8;
         let r_og = self.settings.red_over_green_min as u8;
         let r_ob = self.settings.red_over_blue_min as u8;
@@ -840,7 +866,8 @@ impl NameplateDetector {
             self.settings.top_hat_min as u8,
         );
 
-        let mut green_mask = GrayImage::new(w, h);
+        let mut green_mask = std::mem::take(&mut self.g_mask);
+        green_mask.ensure_size(w, h);
         let g_min = self.settings.green_min as u8;
         let g_or = self.settings.green_over_red_min as u8;
         let g_ob = self.settings.green_over_blue_min as u8;
@@ -861,7 +888,8 @@ impl NameplateDetector {
             self.settings.green_top_hat_min as u8,
         );
 
-        let mut mask = GrayImage::new(w, h);
+        let mut mask = std::mem::take(&mut self.mask);
+        mask.ensure_size(w, h);
         for i in 0..n {
             mask.data[i] = cyan_white.data[i] | red_mask.data[i] | green_mask.data[i];
         }
@@ -878,6 +906,13 @@ impl NameplateDetector {
             );
         }
 
+        self.ch_b = blue;
+        self.ch_g = green;
+        self.ch_r = red;
+        self.ch_val = value;
+        self.cw_mask = cyan_white;
+        self.r_mask = red_mask;
+        self.g_mask = green_mask;
         self.mask = mask;
     }
 

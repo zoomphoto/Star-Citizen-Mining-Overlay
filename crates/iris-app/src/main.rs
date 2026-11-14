@@ -266,32 +266,31 @@ impl eframe::App for ScOverlayEframeApp {
             }
         }
 
-        let (dark_mode, scale) = {
-            let s = self.shared.settings.read();
-            (s.settings_dark_mode, s.settings_window_scale)
-        };
-        let palette = theme::apply_theme(ctx, dark_mode, scale);
+        let interactive_open = self.shared.interactive_open.load(Ordering::Relaxed);
+        if self.root_visible || interactive_open {
+            let (dark_mode, scale) = {
+                let s = self.shared.settings.read();
+                (s.settings_dark_mode, s.settings_window_scale)
+            };
+            let palette = theme::apply_theme(ctx, dark_mode, scale);
 
-        if self.root_visible {
-            let frame = egui::Frame::none()
-                .fill(palette.bg)
-                .inner_margin(Margin::symmetric(16.0, 12.0));
-            egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-                self.settings_ui.render(ui, &palette, &self.shared);
-            });
-        }
+            if self.root_visible {
+                let frame = egui::Frame::none()
+                    .fill(palette.bg)
+                    .inner_margin(Margin::symmetric(16.0, 12.0));
+                egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+                    self.settings_ui.render(ui, &palette, &self.shared);
+                });
+            }
 
-        // Secondary Interactive Overlay viewport (Shift+0) works even when Settings is hidden in tray
-        self.interactive_ui.show_if_open(ctx, &self.shared);
-
-        let repaint_interval = if self.root_visible
-            || self.shared.interactive_open.load(Ordering::Relaxed)
-        {
-            Duration::from_millis(200)
+            // Secondary Interactive Overlay viewport (Shift+0) works even when Settings is hidden in tray
+            self.interactive_ui.show_if_open(ctx, &self.shared);
+            ctx.request_repaint_after(Duration::from_millis(200));
         } else {
-            Duration::from_millis(500)
-        };
-        ctx.request_repaint_after(repaint_interval);
+            // Ensure interactive viewport tears down if it was just closed, then sleep deeply while in tray
+            self.interactive_ui.show_if_open(ctx, &self.shared);
+            ctx.request_repaint_after(Duration::from_millis(2000));
+        }
     }
 }
 

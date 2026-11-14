@@ -23,6 +23,7 @@ pub fn embedded_quantico_font() -> &'static FontArc {
 pub struct SoftwareOverlayPainter {
     brackets: BracketRasterizer,
     pixmap: Option<Pixmap>,
+    bgra_buf: Vec<u8>,
 }
 
 impl Default for SoftwareOverlayPainter {
@@ -38,6 +39,7 @@ impl SoftwareOverlayPainter {
         Self {
             brackets: BracketRasterizer::new(),
             pixmap: None,
+            bgra_buf: Vec::new(),
         }
     }
 
@@ -48,13 +50,28 @@ impl SoftwareOverlayPainter {
         width: u32,
         height: u32,
     ) -> Vec<u8> {
+        self.paint_slice(model, settings, width, height).to_vec()
+    }
+
+    /// Renders into an internal reusable BGRA8 buffer (`width * height * 4` bytes) with zero per-frame heap churn.
+    pub fn paint_slice(
+        &mut self,
+        model: &OverlayModel,
+        settings: &AppSettings,
+        width: u32,
+        height: u32,
+    ) -> &[u8] {
         if width == 0 || height == 0 {
-            return Vec::new();
+            self.bgra_buf.clear();
+            return &self.bgra_buf;
         }
         let w = width as usize;
         let h = height as usize;
+        let total_bytes = w * h * 4;
         if model.is_empty() {
-            return vec![0u8; w * h * 4];
+            self.bgra_buf.resize(total_bytes, 0);
+            self.bgra_buf[..total_bytes].fill(0);
+            return &self.bgra_buf[..total_bytes];
         }
 
         let need_new = self
@@ -66,7 +83,9 @@ impl SoftwareOverlayPainter {
             self.pixmap = Pixmap::new(width, height);
         }
         let Some(pixmap) = self.pixmap.as_mut() else {
-            return vec![0u8; w * h * 4];
+            self.bgra_buf.resize(total_bytes, 0);
+            self.bgra_buf[..total_bytes].fill(0);
+            return &self.bgra_buf[..total_bytes];
         };
         pixmap.fill(Color::TRANSPARENT);
 
@@ -136,16 +155,22 @@ impl SoftwareOverlayPainter {
             mining_layouts.push((m_item, layout));
         }
 
-        // Convert tiny-skia's premultiplied RGBA8 buffer to premultiplied BGRA8
-        let mut bgra = pixmap.data().to_vec();
+        // Copy tiny-skia's premultiplied RGBA8 buffer into reusable BGRA8 buffer,
+        // swapping R <-> B only on non-transparent pixels (98%+ of overlay is transparent 0x00000000).
+        let src_rgba = pixmap.data();
+        self.bgra_buf.resize(total_bytes, 0);
+        let bgra = &mut self.bgra_buf[..total_bytes];
+        bgra.copy_from_slice(src_rgba);
         for px in bgra.chunks_exact_mut(4) {
-            px.swap(0, 2);
+            if px[3] != 0 {
+                px.swap(0, 2);
+            }
         }
 
         // 2. Brackets (`{ }`, `[ ]`, `< >`) rasterized directly into premultiplied BGRA8
         if !model.brackets.is_empty() {
             self.brackets.draw(
-                &mut bgra,
+                bgra,
                 w * 4,
                 w,
                 h,
@@ -165,7 +190,7 @@ impl SoftwareOverlayPainter {
                 panel.font_size
             }) * 1.5;
             Self::draw_outlined_text(
-                &mut bgra,
+                bgra,
                 w,
                 h,
                 "Dossier",
@@ -179,12 +204,12 @@ impl SoftwareOverlayPainter {
         }
 
         if !panel.is_empty() {
-            Self::draw_panel_text(&mut bgra, w, h, &panel);
+            Self::draw_panel_text(bgra, w, h, &panel);
         }
 
         for (m_item, (box_rect, font_px, pad_x, pad_y)) in mining_layouts {
             Self::draw_colored_text(
-                &mut bgra,
+                bgra,
                 w,
                 h,
                 &m_item.text,
@@ -201,7 +226,7 @@ impl SoftwareOverlayPainter {
             );
         }
 
-        bgra
+        &self.bgra_buf[..total_bytes]
     }
 
     fn draw_boundary(pixmap: &mut Pixmap, area: PixelRect, screen_h: f64) {

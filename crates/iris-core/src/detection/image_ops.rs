@@ -31,23 +31,33 @@ impl GrayImage {
         self.width == 0 || self.height == 0 || self.data.is_empty()
     }
 
-    pub fn crop(&self, rect: IntRect) -> Self {
+    pub fn ensure_size(&mut self, width: usize, height: usize) {
+        self.width = width;
+        self.height = height;
+        self.data.resize(width * height, 0);
+    }
+
+    pub fn crop_into(&self, rect: IntRect, dst: &mut Self) {
         let r = rect.clamp_to(self.width as i32, self.height as i32);
         if r.is_empty() {
-            return Self::default();
+            dst.width = 0;
+            dst.height = 0;
+            dst.data.clear();
+            return;
         }
         let w = r.width as usize;
         let h = r.height as usize;
-        let mut out = vec![0u8; w * h];
+        dst.ensure_size(w, h);
         for y in 0..h {
             let src_row = (r.y as usize + y) * self.width + r.x as usize;
-            out[y * w..(y + 1) * w].copy_from_slice(&self.data[src_row..src_row + w]);
+            dst.data[y * w..(y + 1) * w].copy_from_slice(&self.data[src_row..src_row + w]);
         }
-        Self {
-            width: w,
-            height: h,
-            data: out,
-        }
+    }
+
+    pub fn crop(&self, rect: IntRect) -> Self {
+        let mut out = Self::default();
+        self.crop_into(rect, &mut out);
+        out
     }
 }
 
@@ -90,6 +100,40 @@ impl BgrImage {
         self.width == 0 || self.height == 0 || self.data.is_empty()
     }
 
+    pub fn crop_into(&self, rect: IntRect, dst: &mut Self) {
+        let r = rect.clamp_to(self.width as i32, self.height as i32);
+        if r.is_empty() {
+            dst.width = 0;
+            dst.height = 0;
+            dst.data.clear();
+            return;
+        }
+        let w = r.width as usize;
+        let h = r.height as usize;
+        dst.width = w;
+        dst.height = h;
+        dst.data.resize(w * h * 3, 0);
+        for y in 0..h {
+            let src_off = ((r.y as usize + y) * self.width + r.x as usize) * 3;
+            dst.data[y * w * 3..(y + 1) * w * 3]
+                .copy_from_slice(&self.data[src_off..src_off + w * 3]);
+        }
+    }
+
+    pub fn split_channels_into(&self, b: &mut GrayImage, g: &mut GrayImage, r: &mut GrayImage) {
+        let n = self.width * self.height;
+        b.ensure_size(self.width, self.height);
+        g.ensure_size(self.width, self.height);
+        r.ensure_size(self.width, self.height);
+        let src = &self.data[..n * 3];
+        for i in 0..n {
+            let base = i * 3;
+            b.data[i] = src[base];
+            g.data[i] = src[base + 1];
+            r.data[i] = src[base + 2];
+        }
+    }
+
     pub fn crop(&self, rect: IntRect) -> Self {
         let r = rect.clamp_to(self.width as i32, self.height as i32);
         if r.is_empty() {
@@ -128,8 +172,16 @@ impl BgrImage {
     }
 }
 
-/// Van Herk / Gil-Werman O(1)-per-pixel 1D sliding window min/max along rows and columns.
-fn morph_1d_line(src: &[u8], dst: &mut [u8], k: usize, is_max: bool) {
+/// Van Herk / Gil-Werman O(1)-per-pixel 1D sliding window min/max using pre-allocated scratch buffers.
+fn morph_1d_line_buf(
+    src: &[u8],
+    dst: &mut [u8],
+    k: usize,
+    is_max: bool,
+    padded: &mut [u8],
+    prefix: &mut [u8],
+    suffix: &mut [u8],
+) {
     let n = src.len();
     if n == 0 {
         return;
@@ -139,42 +191,50 @@ fn morph_1d_line(src: &[u8], dst: &mut [u8], k: usize, is_max: bool) {
         return;
     }
     let anchor = k / 2;
-    let cmp = |a: u8, b: u8| if is_max { a.max(b) } else { a.min(b) };
-
-    // Padded length so every window [i, i + k - 1] is in bounds with clamped borders
     let pad_left = anchor;
     let pad_right = k - 1 - anchor;
     let m = n + pad_left + pad_right;
-    let mut padded = vec![0u8; m];
-    for i in 0..pad_left {
-        padded[i] = src[0];
-    }
+
+    padded[..pad_left].fill(src[0]);
     padded[pad_left..pad_left + n].copy_from_slice(src);
-    for i in 0..pad_right {
-        padded[pad_left + n + i] = src[n - 1];
-    }
+    padded[pad_left + n..m].fill(src[n - 1]);
 
-    let mut prefix = vec![0u8; m];
-    let mut suffix = vec![0u8; m];
-
-    for i in 0..m {
-        if i % k == 0 {
-            prefix[i] = padded[i];
-        } else {
-            prefix[i] = cmp(prefix[i - 1], padded[i]);
+    if is_max {
+        for i in 0..m {
+            prefix[i] = if i % k == 0 {
+                padded[i]
+            } else {
+                prefix[i - 1].max(padded[i])
+            };
         }
-    }
-    for i in (0..m).rev() {
-        if i == m - 1 || (i + 1) % k == 0 {
-            suffix[i] = padded[i];
-        } else {
-            suffix[i] = cmp(suffix[i + 1], padded[i]);
+        for i in (0..m).rev() {
+            suffix[i] = if i == m - 1 || (i + 1) % k == 0 {
+                padded[i]
+            } else {
+                suffix[i + 1].max(padded[i])
+            };
         }
-    }
-
-    for i in 0..n {
-        let right = i + k - 1;
-        dst[i] = cmp(suffix[i], prefix[right]);
+        for i in 0..n {
+            dst[i] = suffix[i].max(prefix[i + k - 1]);
+        }
+    } else {
+        for i in 0..m {
+            prefix[i] = if i % k == 0 {
+                padded[i]
+            } else {
+                prefix[i - 1].min(padded[i])
+            };
+        }
+        for i in (0..m).rev() {
+            suffix[i] = if i == m - 1 || (i + 1) % k == 0 {
+                padded[i]
+            } else {
+                suffix[i + 1].min(padded[i])
+            };
+        }
+        for i in 0..n {
+            dst[i] = suffix[i].min(prefix[i + k - 1]);
+        }
     }
 }
 
@@ -191,12 +251,19 @@ fn morph_rect(src: &GrayImage, kw: usize, kh: usize, is_max: bool) -> GrayImage 
     if kw == 1 {
         horiz.copy_from_slice(&src.data);
     } else {
+        let mw = w + kw - 1;
+        let mut padded = vec![0u8; mw];
+        let mut prefix = vec![0u8; mw];
+        let mut suffix = vec![0u8; mw];
         for y in 0..h {
-            morph_1d_line(
+            morph_1d_line_buf(
                 &src.data[y * w..(y + 1) * w],
                 &mut horiz[y * w..(y + 1) * w],
                 kw,
                 is_max,
+                &mut padded,
+                &mut prefix,
+                &mut suffix,
             );
         }
     }
@@ -205,16 +272,98 @@ fn morph_rect(src: &GrayImage, kw: usize, kh: usize, is_max: bool) -> GrayImage 
         return GrayImage::from_vec(w, h, horiz);
     }
 
+    // Vertical Van Herk in L2-cache-friendly 128-byte horizontal strips for sequential SIMD execution
+    const STRIP_W: usize = 128;
     let mut out = vec![0u8; w * h];
-    let mut col_in = vec![0u8; h];
-    let mut col_out = vec![0u8; h];
-    for x in 0..w {
-        for y in 0..h {
-            col_in[y] = horiz[y * w + x];
+    let pad_top = kh / 2;
+    let mh = h + kh - 1;
+    let mut prefix = vec![0u8; mh * STRIP_W];
+    let mut suffix = vec![0u8; mh * STRIP_W];
+
+    let clamped_row = |py: usize| -> usize {
+        if py < pad_top {
+            0
+        } else {
+            (py - pad_top).min(h - 1)
         }
-        morph_1d_line(&col_in, &mut col_out, kh, is_max);
-        for y in 0..h {
-            out[y * w + x] = col_out[y];
+    };
+
+    for x0 in (0..w).step_by(STRIP_W) {
+        let sw = (w - x0).min(STRIP_W);
+        if is_max {
+            for py in 0..mh {
+                let sy = clamped_row(py);
+                let src_s = &horiz[sy * w + x0..sy * w + x0 + sw];
+                if py % kh == 0 {
+                    prefix[py * sw..(py + 1) * sw].copy_from_slice(src_s);
+                } else {
+                    let (prev_part, cur_part) = prefix.split_at_mut(py * sw);
+                    let prev_s = &prev_part[(py - 1) * sw..py * sw];
+                    let cur_s = &mut cur_part[..sw];
+                    for x in 0..sw {
+                        cur_s[x] = prev_s[x].max(src_s[x]);
+                    }
+                }
+            }
+            for py in (0..mh).rev() {
+                let sy = clamped_row(py);
+                let src_s = &horiz[sy * w + x0..sy * w + x0 + sw];
+                if py == mh - 1 || (py + 1) % kh == 0 {
+                    suffix[py * sw..(py + 1) * sw].copy_from_slice(src_s);
+                } else {
+                    let (cur_part, next_part) = suffix.split_at_mut((py + 1) * sw);
+                    let cur_s = &mut cur_part[py * sw..(py + 1) * sw];
+                    let next_s = &next_part[..sw];
+                    for x in 0..sw {
+                        cur_s[x] = next_s[x].max(src_s[x]);
+                    }
+                }
+            }
+            for y in 0..h {
+                let suf_s = &suffix[y * sw..(y + 1) * sw];
+                let pre_s = &prefix[(y + kh - 1) * sw..(y + kh) * sw];
+                let dst_s = &mut out[y * w + x0..y * w + x0 + sw];
+                for x in 0..sw {
+                    dst_s[x] = suf_s[x].max(pre_s[x]);
+                }
+            }
+        } else {
+            for py in 0..mh {
+                let sy = clamped_row(py);
+                let src_s = &horiz[sy * w + x0..sy * w + x0 + sw];
+                if py % kh == 0 {
+                    prefix[py * sw..(py + 1) * sw].copy_from_slice(src_s);
+                } else {
+                    let (prev_part, cur_part) = prefix.split_at_mut(py * sw);
+                    let prev_s = &prev_part[(py - 1) * sw..py * sw];
+                    let cur_s = &mut cur_part[..sw];
+                    for x in 0..sw {
+                        cur_s[x] = prev_s[x].min(src_s[x]);
+                    }
+                }
+            }
+            for py in (0..mh).rev() {
+                let sy = clamped_row(py);
+                let src_s = &horiz[sy * w + x0..sy * w + x0 + sw];
+                if py == mh - 1 || (py + 1) % kh == 0 {
+                    suffix[py * sw..(py + 1) * sw].copy_from_slice(src_s);
+                } else {
+                    let (cur_part, next_part) = suffix.split_at_mut((py + 1) * sw);
+                    let cur_s = &mut cur_part[py * sw..(py + 1) * sw];
+                    let next_s = &next_part[..sw];
+                    for x in 0..sw {
+                        cur_s[x] = next_s[x].min(src_s[x]);
+                    }
+                }
+            }
+            for y in 0..h {
+                let suf_s = &suffix[y * sw..(y + 1) * sw];
+                let pre_s = &prefix[(y + kh - 1) * sw..(y + kh) * sw];
+                let dst_s = &mut out[y * w + x0..y * w + x0 + sw];
+                for x in 0..sw {
+                    dst_s[x] = suf_s[x].min(pre_s[x]);
+                }
+            }
         }
     }
     GrayImage::from_vec(w, h, out)
@@ -235,9 +384,9 @@ pub fn morph_open_rect(src: &GrayImage, kw: usize, kh: usize) -> GrayImage {
 
 pub fn morph_tophat_rect(src: &GrayImage, kw: usize, kh: usize) -> GrayImage {
     let opened = morph_open_rect(src, kw, kh);
-    let mut out = vec![0u8; src.data.len()];
+    let mut out = opened.data;
     for i in 0..out.len() {
-        out[i] = src.data[i].saturating_sub(opened.data[i]);
+        out[i] = src.data[i].saturating_sub(out[i]);
     }
     GrayImage::from_vec(src.width, src.height, out)
 }
@@ -249,28 +398,53 @@ pub fn box_blur(src: &GrayImage, ksize: usize) -> GrayImage {
         return src.clone();
     }
     let r = (ksize / 2) as isize;
-    let mut integral = vec![0u64; (w + 1) * (h + 1)];
-    let stride = w + 1;
-    for y in 0..h {
-        let mut row_sum = 0u64;
+    let mut col_sums = vec![0u32; w];
+    let mut row_pref = vec![0u32; w + 1];
+    let mut out = vec![0u8; w * h];
+
+    let init_y1 = (r.clamp(0, h as isize - 1) as usize) + 1;
+    for y in 0..init_y1 {
+        let row = &src.data[y * w..(y + 1) * w];
         for x in 0..w {
-            row_sum += src.data[y * w + x] as u64;
-            integral[(y + 1) * stride + (x + 1)] = integral[y * stride + (x + 1)] + row_sum;
+            col_sums[x] += row[x] as u32;
         }
     }
+    let mut cur_y0 = 0usize;
+    let mut cur_y1 = init_y1;
 
-    let mut out = vec![0u8; w * h];
     for y in 0..h {
-        let y0 = (y as isize - r).clamp(0, h as isize - 1) as usize;
-        let y1 = (y as isize + r).clamp(0, h as isize - 1) as usize + 1;
+        let next_y0 = (y as isize - r).clamp(0, h as isize - 1) as usize;
+        let next_y1 = (y as isize + r).clamp(0, h as isize - 1) as usize + 1;
+        while cur_y1 < next_y1 {
+            let row = &src.data[cur_y1 * w..(cur_y1 + 1) * w];
+            for x in 0..w {
+                col_sums[x] += row[x] as u32;
+            }
+            cur_y1 += 1;
+        }
+        while cur_y0 < next_y0 {
+            let row = &src.data[cur_y0 * w..(cur_y0 + 1) * w];
+            for x in 0..w {
+                col_sums[x] -= row[x] as u32;
+            }
+            cur_y0 += 1;
+        }
+
+        let mut acc = 0u32;
+        row_pref[0] = 0;
+        for x in 0..w {
+            acc += col_sums[x];
+            row_pref[x + 1] = acc;
+        }
+
+        let dy = (next_y1 - next_y0) as u32;
+        let dst_row = &mut out[y * w..(y + 1) * w];
         for x in 0..w {
             let x0 = (x as isize - r).clamp(0, w as isize - 1) as usize;
             let x1 = (x as isize + r).clamp(0, w as isize - 1) as usize + 1;
-            let sum = integral[y1 * stride + x1] + integral[y0 * stride + x0]
-                - integral[y0 * stride + x1]
-                - integral[y1 * stride + x0];
-            let area = ((y1 - y0) * (x1 - x0)) as u64;
-            out[y * w + x] = ((sum + area / 2) / area) as u8;
+            let sum = row_pref[x1] - row_pref[x0];
+            let area = dy * (x1 - x0) as u32;
+            dst_row[x] = ((sum + area / 2) / area) as u8;
         }
     }
     GrayImage::from_vec(w, h, out)

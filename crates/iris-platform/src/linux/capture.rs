@@ -39,6 +39,7 @@ pub struct LinuxFrameCapturer {
     pw_pipeline: Option<PipeWireGstPipeline>,
     pw_failed_at: Option<Instant>,
     x11: Option<(RustConnection, usize)>,
+    recycled_bgr: Option<Vec<u8>>,
 }
 
 impl LinuxFrameCapturer {
@@ -47,6 +48,7 @@ impl LinuxFrameCapturer {
             pw_pipeline: None,
             pw_failed_at: None,
             x11: None,
+            recycled_bgr: None,
         }
     }
 
@@ -155,18 +157,27 @@ impl LinuxFrameCapturer {
             .name("sc-overlay-pw-reader".to_string())
             .spawn(move || {
                 let mut seq = 0u64;
+                let mut buf = vec![0u8; frame_bytes];
                 loop {
-                    let mut buf = vec![0u8; frame_bytes];
+                    buf.resize(frame_bytes, 0);
                     if stdout.read_exact(&mut buf).is_err() {
                         break;
                     }
                     seq += 1;
-                    *latest_writer.lock() = Some(LatestRawBgra {
-                        width: stream_w,
-                        height: stream_h,
-                        data: buf,
-                        seq,
-                    });
+                    let mut guard = latest_writer.lock();
+                    if let Some(existing) = guard.as_mut() {
+                        existing.width = stream_w;
+                        existing.height = stream_h;
+                        existing.seq = seq;
+                        std::mem::swap(&mut existing.data, &mut buf);
+                    } else {
+                        *guard = Some(LatestRawBgra {
+                            width: stream_w,
+                            height: stream_h,
+                            data: std::mem::replace(&mut buf, vec![0u8; frame_bytes]),
+                            seq,
+                        });
+                    }
                 }
             })?;
 
@@ -244,12 +255,14 @@ impl LinuxFrameCapturer {
             return Ok(None);
         }
 
-        Ok(Some(CapturedFrame::from_bgra8(
+        let buf = self.recycled_bgr.take().unwrap_or_default();
+        Ok(Some(CapturedFrame::from_bgra8_with_buf(
             width,
             height,
             width * 4,
             &reply.data,
             now_ms,
+            buf,
         )))
     }
 }
@@ -312,12 +325,14 @@ impl FrameCapturer for LinuxFrameCapturer {
                     if let Some(raw) = guard.as_ref() {
                         if raw.seq != pipe.last_seq {
                             pipe.last_seq = raw.seq;
-                            let frame = CapturedFrame::from_bgra8(
+                            let buf = self.recycled_bgr.take().unwrap_or_default();
+                            let frame = CapturedFrame::from_bgra8_with_buf(
                                 raw.width,
                                 raw.height,
                                 raw.width * 4,
                                 &raw.data,
                                 now_ms,
+                                buf,
                             );
                             return Ok((Some(frame), settings_changed));
                         }
@@ -336,5 +351,9 @@ impl FrameCapturer for LinuxFrameCapturer {
         self.pw_pipeline = None;
         self.pw_failed_at = None;
         self.x11 = None;
+    }
+
+    fn recycle_frame(&mut self, frame: CapturedFrame) {
+        self.recycled_bgr = Some(frame.bgr.data);
     }
 }

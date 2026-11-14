@@ -327,4 +327,96 @@ mod tests {
         let excl = ExclusionList::embedded();
         assert!(!excl.is_empty());
     }
+
+    #[test]
+    fn morphology_exactness_and_frame_latency() {
+        use crate::detection::image_ops::{box_blur, dilate_rect, erode_rect, BgrImage, GrayImage};
+        use crate::detection::{NameplateDetector, NameplateDetectorSettings, NameplateReader};
+        use std::time::Instant;
+
+        // 1. Verify exact bit-for-bit match against brute-force 2D window on an irregular size (203x67)
+        let w = 203usize;
+        let h = 67usize;
+        let mut data = vec![0u8; w * h];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i * 73 + 19) % 251) as u8;
+        }
+        let img = GrayImage::from_vec(w, h, data);
+        let kw = 11usize;
+        let kh = 7usize;
+        let rx = (kw / 2) as isize;
+        let ry = (kh / 2) as isize;
+
+        let fast_dil = dilate_rect(&img, kw, kh);
+        let fast_ero = erode_rect(&img, kw, kh);
+        let fast_blur = box_blur(&img, 9);
+
+        for y in 0..h {
+            for x in 0..w {
+                let mut mx = 0u8;
+                let mut mn = 255u8;
+                for dy in 0..kh as isize {
+                    let sy = (y as isize - ry + dy).clamp(0, h as isize - 1) as usize;
+                    for dx in 0..kw as isize {
+                        let sx = (x as isize - rx + dx).clamp(0, w as isize - 1) as usize;
+                        let v = img.data[sy * w + sx];
+                        mx = mx.max(v);
+                        mn = mn.min(v);
+                    }
+                }
+                assert_eq!(fast_dil.data[y * w + x], mx);
+                assert_eq!(fast_ero.data[y * w + x], mn);
+
+                let y0 = (y as isize - 4).clamp(0, h as isize - 1) as usize;
+                let y1 = (y as isize + 4).clamp(0, h as isize - 1) as usize + 1;
+                let x0 = (x as isize - 4).clamp(0, w as isize - 1) as usize;
+                let x1 = (x as isize + 4).clamp(0, w as isize - 1) as usize + 1;
+                let mut sum = 0u32;
+                for sy in y0..y1 {
+                    for sx in x0..x1 {
+                        sum += img.data[sy * w + sx] as u32;
+                    }
+                }
+                let area = ((y1 - y0) * (x1 - x0)) as u32;
+                let expected_blur = ((sum + area / 2) / area) as u8;
+                assert_eq!(fast_blur.data[y * w + x], expected_blur);
+            }
+        }
+
+        // 2. Measure warm steady-state detector scan latency on a 1920x1080 Star Citizen HUD frame
+        let mut det = NameplateDetector::new(
+            NameplateReader::default(),
+            NameplateDetectorSettings {
+                region_left: 0.15,
+                region_right: 0.85,
+                region_top: 0.15,
+                region_bottom: 0.85,
+                ..NameplateDetectorSettings::default()
+            },
+        );
+        let mut frame_1080 = BgrImage::new(1920, 1080);
+        // Simulate dark space + bright HUD text speckles
+        for i in (0..frame_1080.data.len()).step_by(3) {
+            frame_1080.data[i] = 18;
+            frame_1080.data[i + 1] = 22;
+            frame_1080.data[i + 2] = 26;
+        }
+        for x in 860..980 {
+            for y in [500usize, 502, 518, 520] {
+                let idx = (y * 1920 + x) * 3;
+                frame_1080.data[idx] = 235;
+                frame_1080.data[idx + 1] = 240;
+                frame_1080.data[idx + 2] = 240;
+            }
+        }
+        // Warm up reusable buffers
+        let _ = det.find_candidates(&frame_1080);
+        let iters = 10;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = det.find_candidates(&frame_1080);
+        }
+        let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("1080p warm find_candidates avg: {:.2} ms/frame", avg_ms);
+    }
 }

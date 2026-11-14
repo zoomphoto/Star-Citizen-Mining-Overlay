@@ -40,3 +40,9 @@ image = { version = "0.25", default-features = false, features = ["ico", "png"] 
 
 iris-core = { path = "crates/iris-core" }
 iris-platform = { path = "crates/iris-platform" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

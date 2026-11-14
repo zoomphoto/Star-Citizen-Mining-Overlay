@@ -65,6 +65,7 @@ pub struct Win32FrameCapturer {
     duplicator: Option<DxgiDuplicator>,
     winrt: Option<WinRtWindowCapture>,
     last_method: Option<CaptureMethod>,
+    recycled_bgr: Option<Vec<u8>>,
 }
 
 // D3D11 free-threaded device & WinRT Direct3D11CaptureFramePool::CreateFreeThreaded are agile across threads
@@ -76,6 +77,7 @@ impl Win32FrameCapturer {
             duplicator: None,
             winrt: None,
             last_method: None,
+            recycled_bgr: None,
         }
     }
 
@@ -147,6 +149,7 @@ impl Win32FrameCapturer {
         width: usize,
         height: usize,
         now_ms: f64,
+        buf: Vec<u8>,
     ) -> anyhow::Result<CapturedFrame> {
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -154,7 +157,7 @@ impl Win32FrameCapturer {
             let stride = mapped.RowPitch as usize;
             let total_bytes = stride * height;
             let slice = std::slice::from_raw_parts(mapped.pData as *const u8, total_bytes);
-            let frame = CapturedFrame::from_bgra8(width, height, stride, slice, now_ms);
+            let frame = CapturedFrame::from_bgra8_with_buf(width, height, stride, slice, now_ms, buf);
             context.Unmap(staging, 0);
             Ok(frame)
         }
@@ -255,7 +258,13 @@ impl Win32FrameCapturer {
                 .duplication
                 .AcquireNextFrame(40, &mut frame_info, &mut resource)
             {
-                Ok(()) => {}
+                Ok(()) => {
+                    // LastPresentTime == 0 indicates a cursor-only update with no desktop pixel changes
+                    if frame_info.LastPresentTime == 0 {
+                        let _ = dup.duplication.ReleaseFrame();
+                        return Ok(None);
+                    }
+                }
                 Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                     return Ok(None);
                 }
@@ -299,12 +308,14 @@ impl Win32FrameCapturer {
                 };
                 dup.context
                     .CopySubresourceRegion(&staging, 0, 0, 0, 0, &src_tex, 0, Some(&src_box));
+                let buf = self.recycled_bgr.take().unwrap_or_default();
                 let frame = Self::map_and_read(
                     &dup.context,
                     &staging,
                     copy_w as usize,
                     copy_h as usize,
                     now_ms,
+                    buf,
                 )?;
                 Ok(Some(frame))
             })();
@@ -417,12 +428,14 @@ impl Win32FrameCapturer {
                 let staging =
                     Self::ensure_staging(&w.device, &mut w.staging, desc.Width, desc.Height)?;
                 w.context.CopyResource(&staging, &src_tex);
+                let buf = self.recycled_bgr.take().unwrap_or_default();
                 let captured = Self::map_and_read(
                     &w.context,
                     &staging,
                     desc.Width as usize,
                     desc.Height as usize,
                     now_ms,
+                    buf,
                 )?;
                 Ok(Some(captured))
             }
@@ -466,5 +479,9 @@ impl FrameCapturer for Win32FrameCapturer {
     fn reset(&mut self) {
         self.duplicator = None;
         self.winrt = None;
+    }
+
+    fn recycle_frame(&mut self, frame: CapturedFrame) {
+        self.recycled_bgr = Some(frame.bgr.data);
     }
 }
