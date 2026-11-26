@@ -53,9 +53,22 @@ pub enum TrayAction {
     OpenSettings,
     ToggleOverlay,
     ToggleDebugOverlay,
+    ClearBreadcrumbs,
     OpenLogs,
     OpenConfigDir,
     Quit,
+}
+
+pub trait ClipboardWatcher: Send {
+    /// Returns `Some(text)` when the OS clipboard text has changed since the last poll.
+    fn poll_text(&mut self) -> Option<String>;
+}
+
+pub trait DisplayInfoOcrReader: Send {
+    /// Submits a top-right BGR24 crop (`width * height * 3` bytes) for asynchronous OCR.
+    fn submit_top_right_bgr(&self, bgr: Vec<u8>, width: usize, height: usize);
+    /// Returns the most recent recognized OCR text if a background job completed.
+    fn try_recv_text(&self) -> Option<String>;
 }
 
 pub trait GameWindowDetector: Send {
@@ -146,6 +159,105 @@ pub fn create_hotkey_listener(settings: &AppSettings) -> Box<dyn HotkeyListener>
     {
         Box::new(linux::LinuxHotkeyListener::new(settings))
     }
+}
+
+pub fn create_clipboard_watcher() -> Box<dyn ClipboardWatcher> {
+    #[cfg(windows)]
+    {
+        Box::new(win32::Win32ClipboardWatcher::new())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(linux::LinuxClipboardWatcher::new())
+    }
+}
+
+pub fn create_display_info_ocr() -> Box<dyn DisplayInfoOcrReader> {
+    #[cfg(windows)]
+    {
+        Box::new(win32::Win32DisplayInfoOcr::new())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(linux::LinuxDisplayInfoOcr::new())
+    }
+}
+
+/// Converts a top-right BGR24 crop into an upscaled (up to 3x, capped at 3600px for WinRT
+/// `OcrEngine::MaxImageDimension()`), dark-on-light grayscale image (`Gray8`) optimized for OCR
+/// of Star Citizen's small `r_DisplayInfo` text.
+pub(crate) fn prepare_display_info_gray_3x(
+    bgr: &[u8],
+    width: usize,
+    height: usize,
+) -> (Vec<u8>, usize, usize) {
+    if width < 8 || height < 8 || bgr.len() < width * height * 3 {
+        return (Vec::new(), 0, 0);
+    }
+    let count = width * height;
+    let mut lum = vec![0u8; count];
+    let mut max_l = 0u8;
+    let mut sum_l = 0u64;
+    for (i, px) in bgr.chunks_exact(3).take(count).enumerate() {
+        let luma = ((px[2] as u32 * 77 + px[1] as u32 * 150 + px[0] as u32 * 29) >> 8) as u8;
+        let max_ch = px[0].max(px[1]).max(px[2]);
+        let v = ((luma as u16 + max_ch as u16) / 2) as u8;
+        lum[i] = v;
+        sum_l += v as u64;
+        if v > max_l {
+            max_l = v;
+        }
+    }
+
+    let mean_l = (sum_l / count as u64) as f32;
+    let lo = (mean_l + 8.0).min((max_l as f32) - 40.0).max(0.0);
+    let hi = (max_l as f32).max(lo + 48.0);
+    let span = (hi - lo).max(48.0);
+    for v in &mut lum {
+        let norm = ((*v as f32 - lo) / span).clamp(0.0, 1.0);
+        let crisp = norm.powf(0.85);
+        *v = ((1.0 - crisp) * 255.0).round() as u8;
+    }
+
+    // Choose integer scale up to 3x while staying strictly below WinRT OcrEngine's 4096px limit
+    let max_dim = width.max(height);
+    let scale = if max_dim * 3 <= 3600 {
+        3usize
+    } else if max_dim * 2 <= 3600 {
+        2usize
+    } else {
+        1usize
+    };
+    let w3 = width * scale;
+    let h3 = height * scale;
+    if scale == 1 {
+        return (lum, w3, h3);
+    }
+    let inv_s = 1.0 / scale as f32;
+    let mut out = vec![0u8; w3 * h3];
+    for y3 in 0..h3 {
+        let sy = (y3 as f32 + 0.5) * inv_s - 0.5;
+        let y0 = (sy.floor().max(0.0) as usize).min(height - 1);
+        let y1 = (y0 + 1).min(height - 1);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        let row0 = y0 * width;
+        let row1 = y1 * width;
+        let dst_row = y3 * w3;
+        for x3 in 0..w3 {
+            let sx = (x3 as f32 + 0.5) * inv_s - 0.5;
+            let x0 = (sx.floor().max(0.0) as usize).min(width - 1);
+            let x1 = (x0 + 1).min(width - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let a = lum[row0 + x0] as f32;
+            let b = lum[row0 + x1] as f32;
+            let c = lum[row1 + x0] as f32;
+            let d = lum[row1 + x1] as f32;
+            let top = a + (b - a) * fx;
+            let bot = c + (d - c) * fx;
+            out[dst_row + x3] = (top + (bot - top) * fy).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    (out, w3, h3)
 }
 
 pub fn create_tray_backend(

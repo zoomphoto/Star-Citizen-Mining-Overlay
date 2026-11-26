@@ -114,6 +114,10 @@ impl DataPaths {
         self.data_dir.join("cache.db")
     }
 
+    pub fn breadcrumbs_file(&self) -> PathBuf {
+        self.data_dir.join("breadcrumbs.json")
+    }
+
     pub fn seed_defaults_if_missing(&self) {
         let _ = self.ensure_dirs();
         let seed = |path: PathBuf, content: &str| {

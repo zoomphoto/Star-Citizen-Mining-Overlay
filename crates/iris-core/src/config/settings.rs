@@ -67,6 +67,12 @@ pub struct AppSettings {
     pub timed_overlay_seconds: i32,
     pub mining_disabled: bool,
     pub mining_label_zoom_percent: i32,
+    pub breadcrumbs_enabled: bool,
+    pub breadcrumbs_persist: bool,
+    pub breadcrumbs_visited_radius_km: i32,
+    pub breadcrumbs_screen_cloud: bool,
+    pub breadcrumbs_auto_displayinfo: bool,
+    pub breadcrumbs_auto_interval_secs: i32,
     pub debug_overlay_enabled: bool,
     pub debug_show_candidates: bool,
     /// Linux XDG ScreenCast portal restore token so Bazzite Wayland only prompts once
@@ -97,6 +103,10 @@ impl AppSettings {
     pub const MINING_ZOOM_MIN: i32 = 100;
     pub const MINING_ZOOM_MAX: i32 = 200;
     pub const MINING_ZOOM_STEP: i32 = 10;
+    pub const BREADCRUMB_RADIUS_MIN_KM: i32 = 1;
+    pub const BREADCRUMB_RADIUS_MAX_KM: i32 = 25;
+    pub const BREADCRUMB_INTERVAL_MIN_SECS: i32 = 5;
+    pub const BREADCRUMB_INTERVAL_MAX_SECS: i32 = 120;
     pub const WINDOW_SCALES: [i32; 5] = [100, 110, 125, 150, 175];
 
     pub fn overlay_shown_in_capture(&self) -> bool {
@@ -140,6 +150,12 @@ impl Default for AppSettings {
             timed_overlay_seconds: 10,
             mining_disabled: false,
             mining_label_zoom_percent: 150,
+            breadcrumbs_enabled: true,
+            breadcrumbs_persist: true,
+            breadcrumbs_visited_radius_km: 5,
+            breadcrumbs_screen_cloud: true,
+            breadcrumbs_auto_displayinfo: true,
+            breadcrumbs_auto_interval_secs: 15,
             debug_overlay_enabled: false,
             debug_show_candidates: false,
             linux_portal_restore_token: String::new(),
@@ -330,6 +346,36 @@ impl AppSettingsToml {
                 AppSettings::MINING_ZOOM_STEP,
                 AppSettings::MINING_ZOOM_MIN,
                 AppSettings::MINING_ZOOM_MAX
+            )
+        ));
+        out.push_str(&format!(
+            "breadcrumbs_enabled = {}\n",
+            bool_str(settings.breadcrumbs_enabled)
+        ));
+        out.push_str(&format!(
+            "breadcrumbs_persist = {}\n",
+            bool_str(settings.breadcrumbs_persist)
+        ));
+        out.push_str(&format!(
+            "breadcrumbs_visited_radius_km = {}\n",
+            settings.breadcrumbs_visited_radius_km.clamp(
+                AppSettings::BREADCRUMB_RADIUS_MIN_KM,
+                AppSettings::BREADCRUMB_RADIUS_MAX_KM
+            )
+        ));
+        out.push_str(&format!(
+            "breadcrumbs_screen_cloud = {}\n",
+            bool_str(settings.breadcrumbs_screen_cloud)
+        ));
+        out.push_str(&format!(
+            "breadcrumbs_auto_displayinfo = {}\n",
+            bool_str(settings.breadcrumbs_auto_displayinfo)
+        ));
+        out.push_str(&format!(
+            "breadcrumbs_auto_interval_secs = {}\n",
+            settings.breadcrumbs_auto_interval_secs.clamp(
+                AppSettings::BREADCRUMB_INTERVAL_MIN_SECS,
+                AppSettings::BREADCRUMB_INTERVAL_MAX_SECS
             )
         ));
         out.push_str(&format!(
@@ -650,6 +696,46 @@ impl AppSettingsToml {
             AppSettings::MINING_ZOOM_STEP,
             AppSettings::MINING_ZOOM_MIN,
             AppSettings::MINING_ZOOM_MAX,
+        );
+        s.breadcrumbs_enabled = read_bool(
+            &root,
+            "breadcrumbs_enabled",
+            defaults.breadcrumbs_enabled,
+            &mut warnings,
+        );
+        s.breadcrumbs_persist = read_bool(
+            &root,
+            "breadcrumbs_persist",
+            defaults.breadcrumbs_persist,
+            &mut warnings,
+        );
+        s.breadcrumbs_visited_radius_km = read_int(
+            &root,
+            "breadcrumbs_visited_radius_km",
+            defaults.breadcrumbs_visited_radius_km,
+            AppSettings::BREADCRUMB_RADIUS_MIN_KM,
+            AppSettings::BREADCRUMB_RADIUS_MAX_KM,
+            &mut warnings,
+        );
+        s.breadcrumbs_screen_cloud = read_bool(
+            &root,
+            "breadcrumbs_screen_cloud",
+            defaults.breadcrumbs_screen_cloud,
+            &mut warnings,
+        );
+        s.breadcrumbs_auto_displayinfo = read_bool(
+            &root,
+            "breadcrumbs_auto_displayinfo",
+            defaults.breadcrumbs_auto_displayinfo,
+            &mut warnings,
+        );
+        s.breadcrumbs_auto_interval_secs = read_int(
+            &root,
+            "breadcrumbs_auto_interval_secs",
+            defaults.breadcrumbs_auto_interval_secs,
+            AppSettings::BREADCRUMB_INTERVAL_MIN_SECS,
+            AppSettings::BREADCRUMB_INTERVAL_MAX_SECS,
+            &mut warnings,
         );
         s.debug_overlay_enabled = read_bool(
             &root,

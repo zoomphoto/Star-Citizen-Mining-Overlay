@@ -77,6 +77,14 @@ impl ksni::Tray for ScOverlayKsniTray {
                 ..Default::default()
             }
             .into(),
+            StandardItem {
+                label: "Clear Breadcrumb Trail".to_string(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.tx.send(TrayAction::ClearBreadcrumbs);
+                }),
+                ..Default::default()
+            }
+            .into(),
             ksni::MenuItem::Separator,
             StandardItem {
                 label: "Open log folder".to_string(),

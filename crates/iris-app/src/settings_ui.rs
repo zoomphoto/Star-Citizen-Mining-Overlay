@@ -1595,6 +1595,158 @@ impl SettingsWindowState {
 
                 ui.add_space(10.0);
 
+                // 6b. Mining Breadcrumb Cloud (/showlocation)
+                Self::section_card(ui, p, "MINING BREADCRUMB CLOUD (/showlocation)", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .checkbox(
+                                &mut s.breadcrumbs_enabled,
+                                "Enable /showlocation Breadcrumb Cloud",
+                            )
+                            .on_hover_text(
+                                "Watches your clipboard for Star Citizen /showlocation coordinates, tracks where you have mined, and warns when entering a visited area",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(10.0);
+                        if ui
+                            .add_enabled(
+                                s.breadcrumbs_enabled,
+                                egui::Checkbox::new(
+                                    &mut s.breadcrumbs_persist,
+                                    "Persist trail across restarts",
+                                ),
+                            )
+                            .on_hover_text(
+                                "Saves breadcrumbs to Data/breadcrumbs.json so your trail survives restarts (use Clear Trail when hopping servers)",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(10.0);
+                        if ui
+                            .add_enabled(
+                                s.breadcrumbs_enabled,
+                                egui::Checkbox::new(
+                                    &mut s.breadcrumbs_screen_cloud,
+                                    "Show screen color cloud when entering visited area",
+                                ),
+                            )
+                            .on_hover_text(
+                                "Displays a soft amber/red color cloud glow and alert banner at the top of the screen when you enter a previously visited zone",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(
+                                s.breadcrumbs_enabled,
+                                egui::Checkbox::new(
+                                    &mut s.breadcrumbs_auto_displayinfo,
+                                    "Auto-track live position from r_DisplayInfo 2/3",
+                                ),
+                            )
+                            .on_hover_text(
+                                "Passively reads Zone: Root Pos: from Star Citizen's top-right r_DisplayInfo telemetry every few seconds (no chat spam, 100% EAC-safe)",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(12.0);
+                        ui.label("Auto-Drop Interval:");
+                        if ui
+                            .add_enabled(
+                                s.breadcrumbs_enabled && s.breadcrumbs_auto_displayinfo,
+                                Slider::new(
+                                    &mut s.breadcrumbs_auto_interval_secs,
+                                    AppSettings::BREADCRUMB_INTERVAL_MIN_SECS
+                                        ..=AppSettings::BREADCRUMB_INTERVAL_MAX_SECS,
+                                )
+                                .suffix(" sec"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Visited Cloud Radius:");
+                        if ui
+                            .add_enabled(
+                                s.breadcrumbs_enabled,
+                                Slider::new(
+                                    &mut s.breadcrumbs_visited_radius_km,
+                                    AppSettings::BREADCRUMB_RADIUS_MIN_KM
+                                        ..=AppSettings::BREADCRUMB_RADIUS_MAX_KM,
+                                )
+                                .suffix(" km"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(12.0);
+                        if ui
+                            .button("👁 Preview Cloud (15s)")
+                            .on_hover_text(
+                                "Preview the breadcrumb color cloud and 2D radar widget on your desktop right now",
+                            )
+                            .clicked()
+                        {
+                            let _ = shared.coordinator_tx.send(
+                                CoordinatorCommand::ShowTestOverlay(TestOverlayPart::Breadcrumbs),
+                            );
+                        }
+
+                        let (bc_count, bc_status) = shared.breadcrumb_summary.read().clone();
+                        if ui
+                            .add_enabled(
+                                bc_count > 0,
+                                egui::Button::new(RichText::new("🗑 Clear Trail").color(p.danger)),
+                            )
+                            .on_hover_text("Clear all recorded /showlocation breadcrumbs")
+                            .clicked()
+                        {
+                            let _ = shared
+                                .coordinator_tx
+                                .send(CoordinatorCommand::ClearBreadcrumbs);
+                        }
+
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("{} pts • {}", bc_count, bc_status))
+                                .size(12.0)
+                                .color(p.muted),
+                        );
+                    });
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Tip: Open Star Citizen console (~) and run 'r_DisplayInfo 2' (or 3) for hands-free auto-tracking, or type '/showlocation' in chat anytime to drop a manual pin.",
+                        )
+                        .size(11.5)
+                        .color(p.muted),
+                    );
+                });
+
+                ui.add_space(10.0);
+
                 // 7. Cache, Theme & Diagnostics
                 Self::section_card(ui, p, "CACHE, APPEARANCE & FILES", |ui| {
                     ui.horizontal_wrapped(|ui| {

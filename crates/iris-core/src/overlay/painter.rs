@@ -1,13 +1,31 @@
 use crate::config::settings::AppSettings;
 use crate::mining::reader::MiningSettings;
 use crate::models::{
-    DebugBoxKind, DebugOverlayInfo, MiningLabelItem, OverlayModel, PixelRect,
+    BreadcrumbOverlayInfo, DebugBoxKind, DebugOverlayInfo, MiningLabelItem, OverlayModel,
+    PixelRect, ProximityZone,
 };
 use crate::overlay::metrics::{BracketMetrics, BracketRasterizer};
 use crate::overlay::panel::{PanelLayout, PanelLayoutResult};
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use std::sync::OnceLock;
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, GradientStop, Paint, PathBuilder, Pixmap, Point, RadialGradient, SpreadMode,
+    Stroke, Transform,
+};
+
+struct BreadcrumbHudLayout {
+    card_rect: PixelRect,
+    radar_rect: PixelRect,
+    banner_rect: Option<PixelRect>,
+    scale: f64,
+    header_px: f32,
+    body_px: f32,
+    banner_px: f32,
+    pad_x: f64,
+    pad_y: f64,
+    header_h: f64,
+    footer_line_h: f64,
+}
 
 struct DebugHudLayout {
     card_rect: PixelRect,
@@ -181,6 +199,12 @@ impl SoftwareOverlayPainter {
             layout
         });
 
+        let breadcrumb_layout = model.breadcrumb_info.as_ref().map(|bc| {
+            let layout = Self::compute_breadcrumb_layout(bc, screen_w, screen_h);
+            Self::draw_breadcrumb_vectors(pixmap, bc, &layout, screen_w, screen_h);
+            layout
+        });
+
         // Copy tiny-skia's premultiplied RGBA8 buffer into reusable BGRA8 buffer,
         // swapping R <-> B only on non-transparent pixels (98%+ of overlay is transparent 0x00000000).
         let src_rgba = pixmap.data();
@@ -254,6 +278,12 @@ impl SoftwareOverlayPainter {
 
         if let (Some(dbg), Some(layout)) = (model.debug_info.as_ref(), debug_layout.as_ref()) {
             Self::draw_debug_text(bgra, w, h, dbg, layout);
+        }
+
+        if let (Some(bc), Some(layout)) =
+            (model.breadcrumb_info.as_ref(), breadcrumb_layout.as_ref())
+        {
+            Self::draw_breadcrumb_text(bgra, w, h, bc, layout);
         }
 
         &self.bgra_buf[..total_bytes]
@@ -336,6 +366,47 @@ impl SoftwareOverlayPainter {
             Transform::identity(),
             None,
         );
+    }
+
+    fn stroke_rounded_box(
+        pixmap: &mut Pixmap,
+        r: PixelRect,
+        radius: f64,
+        color: Color,
+        stroke_width: f32,
+    ) {
+        if r.width <= 0.0 || r.height <= 0.0 || stroke_width <= 0.0 {
+            return;
+        }
+        let x = r.x as f32;
+        let y = r.y as f32;
+        let w = r.width as f32;
+        let h = r.height as f32;
+        let rad = (radius as f32).min(w * 0.5).min(h * 0.5).max(0.0);
+
+        let mut pb = PathBuilder::new();
+        pb.move_to(x + rad, y);
+        pb.line_to(x + w - rad, y);
+        pb.quad_to(x + w, y, x + w, y + rad);
+        pb.line_to(x + w, y + h - rad);
+        pb.quad_to(x + w, y + h, x + w - rad, y + h);
+        pb.line_to(x + rad, y + h);
+        pb.quad_to(x, y + h, x, y + h - rad);
+        pb.line_to(x, y + rad);
+        pb.quad_to(x, y, x + rad, y);
+        pb.close();
+
+        let Some(path) = pb.finish() else {
+            return;
+        };
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        paint.anti_alias = true;
+        let stroke = Stroke {
+            width: stroke_width,
+            ..Stroke::default()
+        };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
 
     fn draw_panel_text(bgra: &mut [u8], w: usize, h: usize, panel: &PanelLayoutResult) {
@@ -763,6 +834,505 @@ impl SoftwareOverlayPainter {
                 (232, 238, 246),
             );
         }
+    }
+
+    fn compute_breadcrumb_layout(
+        bc: &BreadcrumbOverlayInfo,
+        screen_w: f64,
+        screen_h: f64,
+    ) -> BreadcrumbHudLayout {
+        let scale = (screen_h / 1080.0).clamp(0.75, 2.25);
+        let pad_x = 10.0 * scale;
+        let pad_y = 8.0 * scale;
+        let header_px = (12.5 * scale) as f32;
+        let body_px = (10.5 * scale) as f32;
+        let banner_px = (15.5 * scale) as f32;
+        let header_h = header_px as f64 * 1.25;
+        let footer_line_h = body_px as f64 * 1.28;
+
+        let card_w = (264.0 * scale).min((screen_w * 0.28).max(180.0));
+        let radar_w = (card_w - 2.0 * pad_x).max(120.0);
+        let radar_h = (166.0 * scale).min((screen_h * 0.24).max(110.0));
+        let card_h = pad_y * 2.0 + header_h + 6.0 * scale + radar_h + 6.0 * scale + footer_line_h * 2.0;
+
+        let margin_x = (18.0 * scale).min(screen_w * 0.04);
+        let margin_y = (22.0 * scale).min(screen_h * 0.05);
+        let card_y = (screen_h - card_h - margin_y).max(margin_y);
+        let card_rect = PixelRect::new(margin_x, card_y, card_w, card_h);
+        let radar_rect = PixelRect::new(
+            card_rect.x + pad_x,
+            card_rect.y + pad_y + header_h + 6.0 * scale,
+            radar_w,
+            radar_h,
+        );
+
+        let banner_rect = if bc.show_screen_cloud && bc.zone != ProximityZone::Clear {
+            let bw = (420.0 * scale).min(screen_w * 0.52);
+            let bh = banner_px as f64 * 1.35 + 14.0 * scale;
+            Some(PixelRect::new(
+                (screen_w - bw) * 0.5,
+                (16.0 * scale).min(screen_h * 0.03),
+                bw,
+                bh,
+            ))
+        } else {
+            None
+        };
+
+        BreadcrumbHudLayout {
+            card_rect,
+            radar_rect,
+            banner_rect,
+            scale,
+            header_px,
+            body_px,
+            banner_px,
+            pad_x,
+            pad_y,
+            header_h,
+            footer_line_h,
+        }
+    }
+
+    fn draw_breadcrumb_vectors(
+        pixmap: &mut Pixmap,
+        bc: &BreadcrumbOverlayInfo,
+        layout: &BreadcrumbHudLayout,
+        screen_w: f64,
+        screen_h: f64,
+    ) {
+        let (zr, zg, zb) = bc.zone.rgb();
+
+        // 1. Ambient translucent color cloud along top-center HUD edge when entering/inside visited zone
+        if bc.show_screen_cloud && bc.zone != ProximityZone::Clear {
+            let cloud_w = (screen_w * 0.65).max(320.0) as f32;
+            let cloud_h = (screen_h * 0.19).max(110.0) as f32;
+            let cloud_x = ((screen_w as f32) - cloud_w) * 0.5;
+            if let Some(rect) = tiny_skia::Rect::from_xywh(cloud_x, 0.0, cloud_w, cloud_h) {
+                let (a_inner, a_mid) = match bc.zone {
+                    ProximityZone::Visited => (118u8, 54u8),
+                    ProximityZone::Approaching => (96u8, 42u8),
+                    ProximityZone::Clear => (0u8, 0u8),
+                };
+                // Draw an elliptical radial gradient centered at top-center (screen_w/2, 0)
+                let unit_center = Point::from_xy(0.0, 0.0);
+                let stops = vec![
+                    GradientStop::new(0.0, Color::from_rgba8(zr, zg, zb, a_inner)),
+                    GradientStop::new(0.45, Color::from_rgba8(zr, zg, zb, a_mid)),
+                    GradientStop::new(1.0, Color::from_rgba8(zr, zg, zb, 0)),
+                ];
+                let xform = Transform::from_scale(cloud_w * 0.52, cloud_h)
+                    .post_translate(screen_w as f32 * 0.5, 0.0);
+                if let Some(shader) = RadialGradient::new(
+                    unit_center,
+                    unit_center,
+                    1.0,
+                    stops,
+                    SpreadMode::Pad,
+                    xform,
+                ) {
+                    let mut paint = Paint::default();
+                    paint.shader = shader;
+                    paint.anti_alias = true;
+                    let path = PathBuilder::from_rect(rect);
+                    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                }
+            }
+
+            if let Some(banner) = layout.banner_rect {
+                let rad = 7.0 * layout.scale;
+                Self::draw_rounded_box(pixmap, banner, rad, Color::from_rgba8(0x10, 0x12, 0x18, 0xCC));
+                Self::stroke_rounded_box(
+                    pixmap,
+                    banner,
+                    rad,
+                    Color::from_rgba8(zr, zg, zb, 0xE6),
+                    (1.5 * layout.scale).max(1.0) as f32,
+                );
+            }
+        }
+
+        // 2. Bottom-left 2D Breadcrumb Cloud Radar Card
+        let card_rad = 7.0 * layout.scale;
+        Self::draw_rounded_box(
+            pixmap,
+            layout.card_rect,
+            card_rad,
+            Color::from_rgba8(0x0D, 0x11, 0x18, 0xDC),
+        );
+        Self::stroke_rounded_box(
+            pixmap,
+            layout.card_rect,
+            card_rad,
+            Color::from_rgba8(zr, zg, zb, 0xB8),
+            (1.25 * layout.scale).max(1.0) as f32,
+        );
+
+        let r_rect = layout.radar_rect;
+        let radar_rad = 5.0 * layout.scale;
+        Self::draw_rounded_box(
+            pixmap,
+            r_rect,
+            radar_rad,
+            Color::from_rgba8(0x07, 0x0A, 0x10, 0xEC),
+        );
+
+        let Some(sk_radar) = tiny_skia::Rect::from_xywh(
+            r_rect.x as f32,
+            r_rect.y as f32,
+            r_rect.width as f32,
+            r_rect.height as f32,
+        ) else {
+            return;
+        };
+        let radar_clip_path = PathBuilder::from_rect(sk_radar);
+
+        // Keep a crisp local mining zoom (3x visited_radius_km, e.g. 15 km radius = 30 km across
+        // for a 5 km cloud) so distant 100+ km trail points never squash your local turns & circles.
+        let max_extent_km = (bc.visited_radius_km * 3.0).max(10.0);
+        let half_w = r_rect.width * 0.5;
+        let half_h = r_rect.height * 0.5;
+        let cx = r_rect.x + half_w;
+        let cy = r_rect.y + half_h;
+        let px_per_km = half_w.min(half_h) / max_extent_km;
+        let cloud_radius_px = ((bc.visited_radius_km * px_per_km) as f32).max(10.0 * layout.scale as f32);
+
+        // Build a lightweight clip mask for the inner radar viewport so corridor clouds never bleed
+        // outside the radar border.
+        let mut radar_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height());
+        if let Some(mask) = radar_mask.as_mut() {
+            mask.fill_path(&radar_clip_path, FillRule::Winding, true, Transform::identity());
+        }
+
+        // 3. Draw glowing color cloud corridor along the entire flight path between points
+        //    so you clearly see the swept swath/direction between every pair of breadcrumbs,
+        //    plus radial clouds around each recorded breadcrumb.
+        if bc.points.len() >= 2 {
+            let mut corridor_pb = PathBuilder::new();
+            let mut started = false;
+            let mut prev_xy: Option<(f32, f32)> = None;
+            let mut has_segment = false;
+            for pt in &bc.points {
+                let px = (cx + pt.dx_km * px_per_km) as f32;
+                let py = (cy - pt.dy_km * px_per_km) as f32;
+                if !started {
+                    corridor_pb.move_to(px, py);
+                    prev_xy = Some((px, py));
+                    started = true;
+                } else if let Some((lx, ly)) = prev_xy {
+                    if (px - lx).hypot(py - ly) >= 1.0 {
+                        corridor_pb.line_to(px, py);
+                        prev_xy = Some((px, py));
+                        has_segment = true;
+                    }
+                }
+            }
+            if has_segment {
+                if let Some(corridor_path) = corridor_pb.finish() {
+                    let (cr, cg, cb) = match bc.zone {
+                        ProximityZone::Visited => (0xFFu8, 0x55u8, 0x38u8),
+                        ProximityZone::Approaching => (0xFFu8, 0xAEu8, 0x18u8),
+                        ProximityZone::Clear => (0x18u8, 0xC8u8, 0xFFu8),
+                    };
+                    let mut outer_p = Paint::default();
+                    outer_p.set_color_rgba8(cr, cg, cb, 40);
+                    outer_p.anti_alias = true;
+                    let outer_w = (cloud_radius_px * 1.45).clamp(10.0, (r_rect.height as f32) * 0.45);
+                    let outer_stroke = Stroke {
+                        width: outer_w,
+                        line_cap: tiny_skia::LineCap::Round,
+                        line_join: tiny_skia::LineJoin::Round,
+                        ..Stroke::default()
+                    };
+                    pixmap.stroke_path(
+                        &corridor_path,
+                        &outer_p,
+                        &outer_stroke,
+                        Transform::identity(),
+                        radar_mask.as_ref(),
+                    );
+
+                    let mut mid_p = Paint::default();
+                    mid_p.set_color_rgba8(cr, cg, cb, 70);
+                    mid_p.anti_alias = true;
+                    let mid_w = (cloud_radius_px * 0.72).clamp(6.0, (r_rect.height as f32) * 0.25);
+                    let mid_stroke = Stroke {
+                        width: mid_w,
+                        line_cap: tiny_skia::LineCap::Round,
+                        line_join: tiny_skia::LineJoin::Round,
+                        ..Stroke::default()
+                    };
+                    pixmap.stroke_path(
+                        &corridor_path,
+                        &mid_p,
+                        &mid_stroke,
+                        Transform::identity(),
+                        radar_mask.as_ref(),
+                    );
+                }
+            }
+        }
+
+        // Radial color clouds around each prior visited breadcrumb (clipped to radar rect)
+        for pt in &bc.points {
+            if pt.is_current {
+                continue;
+            }
+            let px = (cx + pt.dx_km * px_per_km) as f32;
+            let py = (cy - pt.dy_km * px_per_km) as f32;
+            let dist_km = (pt.dx_km * pt.dx_km + pt.dy_km * pt.dy_km + pt.dz_km * pt.dz_km).sqrt();
+            let (cr, cg, cb, a0, a1) = if dist_km <= bc.visited_radius_km {
+                (0xFFu8, 0x45u8, 0x3Au8, 108u8, 46u8)
+            } else if dist_km <= bc.visited_radius_km * 1.6 {
+                (0xFFu8, 0xAAu8, 0x10u8, 88u8, 36u8)
+            } else {
+                (0x18u8, 0xC8u8, 0xFFu8, 68u8, 26u8)
+            };
+
+            let center = Point::from_xy(px, py);
+            let stops = vec![
+                GradientStop::new(0.0, Color::from_rgba8(cr, cg, cb, a0)),
+                GradientStop::new(0.55, Color::from_rgba8(cr, cg, cb, a1)),
+                GradientStop::new(1.0, Color::from_rgba8(cr, cg, cb, 0)),
+            ];
+            if let Some(shader) = RadialGradient::new(
+                center,
+                center,
+                cloud_radius_px,
+                stops,
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) {
+                let mut paint = Paint::default();
+                paint.shader = shader;
+                paint.anti_alias = true;
+                pixmap.fill_path(
+                    &radar_clip_path,
+                    &paint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+
+        // 4. Subtle crosshair & range rings (1x visited radius and 2x visited radius)
+        let mut grid_paint = Paint::default();
+        grid_paint.set_color_rgba8(0x90, 0xA4, 0xB8, 0x30);
+        grid_paint.anti_alias = true;
+        let thin_stroke = Stroke {
+            width: (1.0 * layout.scale).max(1.0) as f32,
+            ..Stroke::default()
+        };
+        let mut h_line = PathBuilder::new();
+        h_line.move_to(r_rect.x as f32, cy as f32);
+        h_line.line_to(r_rect.right() as f32, cy as f32);
+        if let Some(p) = h_line.finish() {
+            pixmap.stroke_path(&p, &grid_paint, &thin_stroke, Transform::identity(), None);
+        }
+        let mut v_line = PathBuilder::new();
+        v_line.move_to(cx as f32, r_rect.y as f32);
+        v_line.line_to(cx as f32, r_rect.bottom() as f32);
+        if let Some(p) = v_line.finish() {
+            pixmap.stroke_path(&p, &grid_paint, &thin_stroke, Transform::identity(), None);
+        }
+
+        for (mult, col) in [
+            (1.0f32, Color::from_rgba8(zr, zg, zb, 0x66)),
+            (2.0f32, Color::from_rgba8(0x90, 0xA4, 0xB8, 0x2E)),
+        ] {
+            let ring_r = cloud_radius_px * mult;
+            if ring_r >= 4.0 && ring_r < (half_w.min(half_h) as f32) - 2.0 {
+                if let Some(ring_path) = PathBuilder::from_circle(cx as f32, cy as f32, ring_r) {
+                    let mut rp = Paint::default();
+                    rp.set_color(col);
+                    rp.anti_alias = true;
+                    pixmap.stroke_path(&ring_path, &rp, &thin_stroke, Transform::identity(), None);
+                }
+            }
+        }
+
+        // 5. Trail polyline connecting recorded breadcrumbs in order (clipped to radar viewport)
+        if bc.points.len() >= 2 {
+            let mut trail_pb = PathBuilder::new();
+            let mut started = false;
+            let mut prev_xy: Option<(f32, f32)> = None;
+            let mut has_segment = false;
+            for pt in &bc.points {
+                let px = (cx + pt.dx_km * px_per_km) as f32;
+                let py = (cy - pt.dy_km * px_per_km) as f32;
+                if !started {
+                    trail_pb.move_to(px, py);
+                    prev_xy = Some((px, py));
+                    started = true;
+                } else if let Some((lx, ly)) = prev_xy {
+                    if (px - lx).hypot(py - ly) >= 1.0 {
+                        trail_pb.line_to(px, py);
+                        prev_xy = Some((px, py));
+                        has_segment = true;
+                    }
+                }
+            }
+            if has_segment {
+                if let Some(tp) = trail_pb.finish() {
+                    let mut lp = Paint::default();
+                    lp.set_color_rgba8(0xD8, 0xF4, 0xFF, 0xA8);
+                    lp.anti_alias = true;
+                    let trail_stroke = Stroke {
+                        width: (1.5 * layout.scale).max(1.0) as f32,
+                        line_cap: tiny_skia::LineCap::Round,
+                        line_join: tiny_skia::LineJoin::Round,
+                        ..Stroke::default()
+                    };
+                    pixmap.stroke_path(
+                        &tp,
+                        &lp,
+                        &trail_stroke,
+                        Transform::identity(),
+                        radar_mask.as_ref(),
+                    );
+                }
+            }
+        }
+
+        // 6. Crisp dots for prior points + heading arrow / marker for current position
+        let dot_r = (2.6 * layout.scale).max(2.0) as f32;
+        for pt in &bc.points {
+            if pt.is_current {
+                continue;
+            }
+            let px = cx + pt.dx_km * px_per_km;
+            let py = cy - pt.dy_km * px_per_km;
+            if px < r_rect.x + 2.0
+                || px > r_rect.right() - 2.0
+                || py < r_rect.y + 2.0
+                || py > r_rect.bottom() - 2.0
+            {
+                continue;
+            }
+            if let Some(dot) = PathBuilder::from_circle(px as f32, py as f32, dot_r) {
+                let mut dp = Paint::default();
+                dp.set_color_rgba8(0xE8, 0xF6, 0xFF, 0xCC);
+                dp.anti_alias = true;
+                pixmap.fill_path(&dot, &dp, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+
+        // Current ship marker at radar center
+        let ship_r = (4.8 * layout.scale).max(3.5) as f32;
+        if let Some(heading) = bc.heading_rad {
+            // Note: screen Y is inverted relative to space Y
+            let angle = -heading;
+            let tip_x = cx as f32 + angle.cos() as f32 * ship_r * 1.35;
+            let tip_y = cy as f32 + angle.sin() as f32 * ship_r * 1.35;
+            let left_a = angle + 2.45;
+            let right_a = angle - 2.45;
+            let mut pb = PathBuilder::new();
+            pb.move_to(tip_x, tip_y);
+            pb.line_to(
+                cx as f32 + left_a.cos() as f32 * ship_r,
+                cy as f32 + left_a.sin() as f32 * ship_r,
+            );
+            pb.line_to(
+                cx as f32 + right_a.cos() as f32 * ship_r,
+                cy as f32 + right_a.sin() as f32 * ship_r,
+            );
+            pb.close();
+            if let Some(tri) = pb.finish() {
+                let mut sp = Paint::default();
+                sp.set_color_rgba8(0xFF, 0xFF, 0xFF, 0xFF);
+                sp.anti_alias = true;
+                pixmap.fill_path(&tri, &sp, FillRule::Winding, Transform::identity(), None);
+            }
+        } else if let Some(dot) = PathBuilder::from_circle(cx as f32, cy as f32, ship_r * 0.85) {
+            let mut sp = Paint::default();
+            sp.set_color_rgba8(0xFF, 0xFF, 0xFF, 0xFF);
+            sp.anti_alias = true;
+            pixmap.fill_path(&dot, &sp, FillRule::Winding, Transform::identity(), None);
+        }
+
+        // Radar inner border
+        Self::stroke_rounded_box(
+            pixmap,
+            r_rect,
+            radar_rad,
+            Color::from_rgba8(0x64, 0x74, 0x8B, 0x60),
+            (1.0 * layout.scale).max(1.0) as f32,
+        );
+    }
+
+    fn draw_breadcrumb_text(
+        bgra: &mut [u8],
+        w: usize,
+        h: usize,
+        bc: &BreadcrumbOverlayInfo,
+        layout: &BreadcrumbHudLayout,
+    ) {
+        let (zr, zg, zb) = bc.zone.rgb();
+
+        if let Some(banner) = layout.banner_rect {
+            Self::draw_outlined_text_rgb(
+                bgra,
+                w,
+                h,
+                &bc.headline,
+                banner.x + 12.0 * layout.scale,
+                banner.y + 4.0 * layout.scale,
+                (banner.width - 24.0 * layout.scale).max(40.0),
+                banner.height - 8.0 * layout.scale,
+                layout.banner_px,
+                true,
+                (zr, zg, zb),
+            );
+        }
+
+        let header_w = (layout.card_rect.width - 2.0 * layout.pad_x).max(40.0);
+        let badge = match bc.zone {
+            ProximityZone::Clear => "BREADCRUMB CLOUD  [FRESH]",
+            ProximityZone::Approaching => "BREADCRUMB CLOUD  [NEAR]",
+            ProximityZone::Visited => "BREADCRUMB CLOUD  [VISITED]",
+        };
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            badge,
+            layout.card_rect.x + layout.pad_x,
+            layout.card_rect.y + layout.pad_y,
+            header_w,
+            layout.header_h,
+            layout.header_px,
+            false,
+            (zr, zg, zb),
+        );
+
+        let footer_y0 = layout.radar_rect.bottom() + 5.0 * layout.scale;
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            &bc.headline,
+            layout.card_rect.x + layout.pad_x,
+            footer_y0,
+            header_w,
+            layout.footer_line_h,
+            layout.body_px,
+            false,
+            (238, 244, 252),
+        );
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            &bc.subline,
+            layout.card_rect.x + layout.pad_x,
+            footer_y0 + layout.footer_line_h,
+            header_w,
+            layout.footer_line_h,
+            layout.body_px,
+            false,
+            (168, 184, 204),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

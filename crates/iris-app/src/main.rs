@@ -48,6 +48,7 @@ impl CliOptions {
                 "--debug" => opts.ipc_cmd = Some(IpcCommand::ToggleDebugOverlay),
                 "--timed" => opts.ipc_cmd = Some(IpcCommand::TimedOverlay),
                 "--interactive" => opts.ipc_cmd = Some(IpcCommand::InteractiveOverlay),
+                "--clear-trail" => opts.ipc_cmd = Some(IpcCommand::ClearBreadcrumbs),
                 "--quit" => opts.ipc_cmd = Some(IpcCommand::Quit),
                 "-h" | "--help" => opts.print_help = true,
                 "-V" | "--version" => opts.print_version = true,
@@ -99,6 +100,7 @@ fn main() -> anyhow::Result<()> {
                --debug         Toggle the live Debug / Heartbeat HUD on/off (signals running instance)\n  \
                --timed         Trigger timed overlay peek (signals running instance)\n  \
                --interactive   Open/close Interactive Citizen Dossier (signals running instance)\n  \
+               --clear-trail   Clear recorded /showlocation mining breadcrumbs (signals running instance)\n  \
                --quit          Stop a running SC Overlay instance\n  \
                --portable      Store Config/, Data/, and Logs/ next to the executable\n  \
                -h, --help      Print help\n  \
@@ -162,6 +164,7 @@ fn main() -> anyhow::Result<()> {
                 | IpcCommand::ToggleDebugOverlay
                 | IpcCommand::TimedOverlay
                 | IpcCommand::InteractiveOverlay
+                | IpcCommand::ClearBreadcrumbs
         )
     );
     let start_settings_open = !cli.start_minimized && !action_only;

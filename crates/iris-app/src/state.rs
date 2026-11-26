@@ -25,6 +25,7 @@ pub enum CoordinatorCommand {
     ToggleDebugOverlay,
     TimedOverlay,
     OpenInteractive,
+    ClearBreadcrumbs,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +73,7 @@ pub struct AppSharedState {
     pub last_game_window: RwLock<GameWindowInfo>,
     pub live_roster: RwLock<Vec<RosterEntry>>,
     pub live_diagnostics: RwLock<LiveDiagnosticsSnapshot>,
+    pub breadcrumb_summary: RwLock<(usize, String)>,
     pub status_banner: RwLock<Option<StatusMessage>>,
     pub update_available: RwLock<Option<(String, String)>>,
     pub coordinator_tx: Sender<CoordinatorCommand>,
@@ -105,6 +107,7 @@ impl AppSharedState {
             last_game_window: RwLock::new(GameWindowInfo::default()),
             live_roster: RwLock::new(Vec::new()),
             live_diagnostics: RwLock::new(LiveDiagnosticsSnapshot::default()),
+            breadcrumb_summary: RwLock::new((0, "No breadcrumbs recorded yet".to_string())),
             status_banner: RwLock::new(None),
             update_available: RwLock::new(None),
             coordinator_tx,

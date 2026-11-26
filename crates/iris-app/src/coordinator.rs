@@ -1,8 +1,12 @@
 use crate::state::{AppSharedState, CoordinatorCommand, LiveDiagnosticsSnapshot};
 use chrono::{Duration as ChronoDuration, Utc};
 use crossbeam_channel::Receiver;
+use iris_core::breadcrumbs::{BreadcrumbTrail, DisplayInfoStabilizer, RecordOutcome, SpaceCoord};
 use iris_core::config::{AppSettings, CaptureMethod};
-use iris_core::models::{DebugOverlayInfo, DebugStatusLevel, IntRect, OverlayModel};
+use iris_core::models::{
+    BreadcrumbOverlayInfo, DebugOverlayInfo, DebugStatusLevel, IntRect, OverlayModel,
+    ProximityZone,
+};
 use iris_core::overlay::{
     BorderlessNoticeTracker, GameWindowRules, GameWindowState, SoftwareOverlayPainter,
     TestOverlayBuilder, TestOverlayPart, TrackingBoundary,
@@ -11,9 +15,9 @@ use iris_core::pipeline::{
     LiveDetectionPipeline, PipelineStats, TimedOverlayPress, TimedOverlayRun,
 };
 use iris_platform::{
-    create_frame_capturer, create_game_detector, create_hotkey_listener, create_overlay_window,
-    create_tray_backend, open_folder_or_file, HotkeyAction, IpcCommand, OverlayWindowBackend,
-    SingleInstanceIpc, TrayAction,
+    create_clipboard_watcher, create_display_info_ocr, create_frame_capturer, create_game_detector,
+    create_hotkey_listener, create_overlay_window, create_tray_backend, open_folder_or_file,
+    HotkeyAction, IpcCommand, OverlayWindowBackend, SingleInstanceIpc, TrayAction,
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -22,6 +26,7 @@ use std::time::{Duration, Instant};
 
 const TEST_OVERLAY_DURATION_MS: f64 = 15_000.0;
 const TOGGLE_TOAST_DURATION_MS: f64 = 2_400.0;
+const BREADCRUMB_TOAST_DURATION_MS: f64 = 5_000.0;
 const BORDERLESS_TOAST_DURATION_MS: f64 = 8_000.0;
 
 pub fn spawn_coordinator(
@@ -51,6 +56,35 @@ fn run_coordinator_loop(
     let mut detector = create_game_detector();
     let mut capturer = create_frame_capturer();
     let mut hotkeys = create_hotkey_listener(&initial_settings);
+    let mut clipboard = create_clipboard_watcher();
+    let display_info_ocr = create_display_info_ocr();
+    let mut display_info_stab = DisplayInfoStabilizer::default();
+    let mut live_space_pos: Option<SpaceCoord> = None;
+    let mut last_display_info_submit_ms: f64 = f64::NEG_INFINITY;
+    let mut last_ocr_diag_log_ms: f64 = f64::NEG_INFINITY;
+    let mut breadcrumbs = if initial_settings.breadcrumbs_persist {
+        BreadcrumbTrail::load(&shared.paths.breadcrumbs_file())
+    } else {
+        BreadcrumbTrail::default()
+    };
+    let mut cached_breadcrumb_info: Option<BreadcrumbOverlayInfo> = None;
+    let mut last_breadcrumb_refresh_ms: f64 = f64::NEG_INFINITY;
+    {
+        let summary = if breadcrumbs.is_empty() {
+            "No breadcrumbs recorded yet".to_string()
+        } else {
+            breadcrumbs
+                .build_overlay_info(
+                    initial_settings.breadcrumbs_visited_radius_km as f64,
+                    initial_settings.breadcrumbs_screen_cloud,
+                    None,
+                    Utc::now(),
+                )
+                .map(|i| i.headline)
+                .unwrap_or_else(|| "Trail loaded".to_string())
+        };
+        *shared.breadcrumb_summary.write() = (breadcrumbs.len(), summary);
+    }
     let mut tray = match create_tray_backend(
         !initial_settings.overlay_disabled,
         initial_settings.debug_overlay_enabled,
@@ -184,6 +218,31 @@ fn run_coordinator_loop(
         shared.request_repaint();
     };
 
+    let apply_clear_breadcrumbs = |shared: &Arc<AppSharedState>,
+                                   breadcrumbs: &mut BreadcrumbTrail,
+                                   display_info_stab: &mut DisplayInfoStabilizer,
+                                   live_space_pos: &mut Option<SpaceCoord>,
+                                   cached_breadcrumb_info: &mut Option<BreadcrumbOverlayInfo>,
+                                   transient_toast: &mut Option<(String, f64)>,
+                                   now_ms: f64| {
+        breadcrumbs.clear();
+        display_info_stab.reset();
+        *live_space_pos = None;
+        *cached_breadcrumb_info = None;
+        let path = shared.paths.breadcrumbs_file();
+        if shared.settings.read().breadcrumbs_persist {
+            let _ = breadcrumbs.save(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        *shared.breadcrumb_summary.write() = (0, "Trail cleared".to_string());
+        *transient_toast = Some((
+            "Breadcrumb trail cleared".to_string(),
+            now_ms + TOGGLE_TOAST_DURATION_MS,
+        ));
+        shared.request_repaint();
+    };
+
     if let Some(cmd) = initial_action {
         let now_ms = now_ms_fn();
         match cmd {
@@ -205,6 +264,15 @@ fn run_coordinator_loop(
             }
             IpcCommand::TimedOverlay => apply_timed(&shared, &mut timed_run, now_ms),
             IpcCommand::InteractiveOverlay => apply_interactive(&shared),
+            IpcCommand::ClearBreadcrumbs => apply_clear_breadcrumbs(
+                &shared,
+                &mut breadcrumbs,
+                &mut display_info_stab,
+                &mut live_space_pos,
+                &mut cached_breadcrumb_info,
+                &mut transient_toast,
+                now_ms,
+            ),
             IpcCommand::Quit => {
                 shared.quit_requested.store(true, Ordering::Relaxed);
                 shared.request_repaint();
@@ -248,6 +316,15 @@ fn run_coordinator_loop(
                 }
                 IpcCommand::TimedOverlay => apply_timed(&shared, &mut timed_run, now_ms),
                 IpcCommand::InteractiveOverlay => apply_interactive(&shared),
+                IpcCommand::ClearBreadcrumbs => apply_clear_breadcrumbs(
+                    &shared,
+                    &mut breadcrumbs,
+                    &mut display_info_stab,
+                    &mut live_space_pos,
+                    &mut cached_breadcrumb_info,
+                    &mut transient_toast,
+                    now_ms,
+                ),
                 IpcCommand::Quit => {
                     shared.quit_requested.store(true, Ordering::Relaxed);
                     shared.request_repaint();
@@ -279,6 +356,17 @@ fn run_coordinator_loop(
                 }
                 TrayAction::ToggleDebugOverlay => {
                     apply_debug_toggle(&shared, &mut tray, &mut transient_toast, now_ms);
+                }
+                TrayAction::ClearBreadcrumbs => {
+                    apply_clear_breadcrumbs(
+                        &shared,
+                        &mut breadcrumbs,
+                        &mut display_info_stab,
+                        &mut live_space_pos,
+                        &mut cached_breadcrumb_info,
+                        &mut transient_toast,
+                        now_ms,
+                    );
                 }
                 TrayAction::OpenLogs => {
                     let _ = open_folder_or_file(&shared.paths.logs_dir);
@@ -321,6 +409,7 @@ fn run_coordinator_loop(
                         t.set_debug_enabled(s.debug_overlay_enabled);
                     }
                     cached_debug_info = None;
+                    cached_breadcrumb_info = None;
                     if reset_capture {
                         capturer.reset();
                     }
@@ -352,6 +441,17 @@ fn run_coordinator_loop(
                 CoordinatorCommand::OpenInteractive => {
                     apply_interactive(&shared);
                 }
+                CoordinatorCommand::ClearBreadcrumbs => {
+                    apply_clear_breadcrumbs(
+                        &shared,
+                        &mut breadcrumbs,
+                        &mut display_info_stab,
+                        &mut live_space_pos,
+                        &mut cached_breadcrumb_info,
+                        &mut transient_toast,
+                        now_ms,
+                    );
+                }
             }
         }
 
@@ -372,12 +472,121 @@ fn run_coordinator_loop(
             }
         }
 
-        // 5. Poll Star Citizen window state
+        // 5. Poll Star Citizen window state & /showlocation clipboard updates
         let game = detector.poll();
         *shared.last_game_window.write() = game.clone();
 
         let mut settings = shared.settings.read().clone();
         let interactive_open = shared.interactive_open.load(Ordering::Relaxed);
+
+        if settings.breadcrumbs_enabled {
+            if let Some(clip_text) = clipboard.poll_text() {
+                if let Some(coord) = SpaceCoord::parse_showlocation(&clip_text) {
+                    let now_utc = Utc::now();
+                    let radius_km = settings.breadcrumbs_visited_radius_km as f64;
+                    if let RecordOutcome::Recorded { point, proximity } =
+                        breadcrumbs.record(coord, radius_km, None, now_utc)
+                    {
+                        display_info_stab.note_manual_drop(coord, now_utc);
+                        // Keep live_space_pos = None on manual /showlocation so build_overlay_info
+                        // evaluates this new point strictly against *earlier* points (never 0.0 km to itself).
+                        live_space_pos = None;
+                        if settings.breadcrumbs_persist {
+                            if let Err(err) = breadcrumbs.save(&shared.paths.breadcrumbs_file()) {
+                                tracing::warn!("Failed saving breadcrumbs: {}", err);
+                            }
+                        }
+                        let toast = BreadcrumbTrail::toast_text(&point, &proximity);
+                        tracing::info!(
+                            "Breadcrumb #{} logged ({:?}, nearest={:?} km)",
+                            point.id,
+                            proximity.zone,
+                            proximity.nearest_distance_km
+                        );
+                        transient_toast = Some((toast, now_ms + BREADCRUMB_TOAST_DURATION_MS));
+                        cached_breadcrumb_info = breadcrumbs.build_overlay_info(
+                            radius_km,
+                            settings.breadcrumbs_screen_cloud,
+                            live_space_pos,
+                            now_utc,
+                        );
+                        last_breadcrumb_refresh_ms = now_ms;
+                        let headline = cached_breadcrumb_info
+                            .as_ref()
+                            .map(|i| i.headline.clone())
+                            .unwrap_or_else(|| format!("Breadcrumb #{}", point.id));
+                        *shared.breadcrumb_summary.write() = (breadcrumbs.len(), headline);
+                        shared.request_repaint();
+                    }
+                }
+            }
+
+            if settings.breadcrumbs_auto_displayinfo {
+                if let Some(ocr_text) = display_info_ocr.try_recv_text() {
+                    if let Some((raw_coord, dual_confirmed)) =
+                        SpaceCoord::parse_display_info(&ocr_text)
+                    {
+                        let now_utc = Utc::now();
+                        if let Some(accepted) =
+                            display_info_stab.ingest(raw_coord, dual_confirmed, now_utc)
+                        {
+                            live_space_pos = Some(accepted);
+                            let radius_km = settings.breadcrumbs_visited_radius_km as f64;
+                            if display_info_stab.should_auto_drop(
+                                accepted,
+                                settings.breadcrumbs_auto_interval_secs as i64,
+                                now_utc,
+                            ) {
+                                if let RecordOutcome::Recorded { point, proximity } =
+                                    breadcrumbs.record(accepted, radius_km, None, now_utc)
+                                {
+                                    if settings.breadcrumbs_persist {
+                                        if let Err(err) =
+                                            breadcrumbs.save(&shared.paths.breadcrumbs_file())
+                                        {
+                                            tracing::warn!("Failed saving breadcrumbs: {}", err);
+                                        }
+                                    }
+                                    tracing::info!(
+                                        "Auto breadcrumb #{} from r_DisplayInfo ({:?}, nearest={:?} km)",
+                                        point.id,
+                                        proximity.zone,
+                                        proximity.nearest_distance_km
+                                    );
+                                    if proximity.zone != ProximityZone::Clear {
+                                        let toast = BreadcrumbTrail::toast_text(&point, &proximity);
+                                        transient_toast =
+                                            Some((toast, now_ms + BREADCRUMB_TOAST_DURATION_MS));
+                                    }
+                                }
+                            }
+                            cached_breadcrumb_info = breadcrumbs.build_overlay_info(
+                                radius_km,
+                                settings.breadcrumbs_screen_cloud,
+                                live_space_pos,
+                                now_utc,
+                            );
+                            last_breadcrumb_refresh_ms = now_ms;
+                            let headline = cached_breadcrumb_info
+                                .as_ref()
+                                .map(|i| i.headline.clone())
+                                .unwrap_or_else(|| "Live r_DisplayInfo tracking".to_string());
+                            *shared.breadcrumb_summary.write() = (breadcrumbs.len(), headline);
+                            shared.request_repaint();
+                        } else {
+                            // First unconfirmed read — waiting for 2nd consistent frame
+                            let status = "Acquiring r_DisplayInfo lock (1/2)…".to_string();
+                            *shared.breadcrumb_summary.write() = (breadcrumbs.len(), status);
+                            shared.request_repaint();
+                        }
+                    } else if now_ms - last_ocr_diag_log_ms >= 30_000.0 {
+                        last_ocr_diag_log_ms = now_ms;
+                        let sample = sanitize_ascii(&ocr_text.replace('\n', " | "), 120);
+                        tracing::info!("r_DisplayInfo OCR sample (no Root Pos matched): {}", sample);
+                    }
+                }
+            }
+        }
 
         // Retry creating overlay window lazily if display server wasn't ready earlier
         if overlay.is_none() && (game.present || test_overlay.is_some()) {
@@ -596,6 +805,33 @@ fn run_coordinator_loop(
                             let social_guard = shared.social.read();
                             pipeline.process_frame(&frame, &settings, &social_guard)
                         };
+                        if settings.breadcrumbs_enabled
+                            && settings.breadcrumbs_auto_displayinfo
+                            && !snap.blank_picture
+                            && now_ms - last_display_info_submit_ms >= 1_500.0
+                        {
+                            last_display_info_submit_ms = now_ms;
+                            let fw = frame.bgr.width;
+                            let fh = frame.bgr.height;
+                            if fw >= 320 && fh >= 200 {
+                                // Top 15% x right 36% isolates CamDir + Zone: ... + Zone: solarsystem + Zone: Root Pos:
+                                // above the comms/party icon while staying under WinRT's 4096px OCR limit.
+                                let cw = ((fw as f64) * 0.36).round() as usize;
+                                let ch = ((fh as f64) * 0.15).round() as usize;
+                                let x0 = fw.saturating_sub(cw);
+                                let mut crop = Vec::with_capacity(cw * ch * 3);
+                                for y in 0..ch {
+                                    let row_start = (y * fw + x0) * 3;
+                                    let row_end = row_start + cw * 3;
+                                    if row_end <= frame.bgr.data.len() {
+                                        crop.extend_from_slice(&frame.bgr.data[row_start..row_end]);
+                                    }
+                                }
+                                if crop.len() == cw * ch * 3 {
+                                    display_info_ocr.submit_top_right_bgr(crop, cw, ch);
+                                }
+                            }
+                        }
                         capturer.recycle_frame(frame);
                         if !snap.roster.is_empty() || last_roster_len != 0 {
                             last_roster_len = snap.roster.len();
@@ -675,6 +911,40 @@ fn run_coordinator_loop(
         } else {
             cached_debug_info = None;
             model_to_draw.debug_info = None;
+        }
+
+        if effective_overlay_active && settings.breadcrumbs_enabled {
+            if cached_breadcrumb_info.is_none() || now_ms - last_breadcrumb_refresh_ms >= 5_000.0 {
+                last_breadcrumb_refresh_ms = now_ms;
+                cached_breadcrumb_info = breadcrumbs
+                    .build_overlay_info(
+                        settings.breadcrumbs_visited_radius_km as f64,
+                        settings.breadcrumbs_screen_cloud,
+                        live_space_pos,
+                        Utc::now(),
+                    )
+                    .or_else(|| {
+                        Some(BreadcrumbOverlayInfo {
+                            zone: ProximityZone::Clear,
+                            headline: if settings.breadcrumbs_auto_displayinfo {
+                                "WAITING FOR r_DisplayInfo / /showlocation".to_string()
+                            } else {
+                                "READY - Type /showlocation in chat".to_string()
+                            },
+                            subline: format!(
+                                "0 pts  |  Cloud {} km",
+                                settings.breadcrumbs_visited_radius_km
+                            ),
+                            visited_radius_km: settings.breadcrumbs_visited_radius_km as f64,
+                            heading_rad: None,
+                            show_screen_cloud: false,
+                            points: Vec::new(),
+                        })
+                    });
+            }
+            model_to_draw.breadcrumb_info = cached_breadcrumb_info.clone();
+        } else {
+            model_to_draw.breadcrumb_info = None;
         }
 
         if model_to_draw.is_empty() {

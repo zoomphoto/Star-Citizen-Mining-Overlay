@@ -1,3 +1,4 @@
+pub mod breadcrumbs;
 pub mod config;
 pub mod detection;
 pub mod lookup;
@@ -360,6 +361,108 @@ mod tests {
     fn default_exclusions_filter_hud_tokens() {
         let excl = ExclusionList::embedded();
         assert!(!excl.is_empty());
+    }
+
+    #[test]
+    fn breadcrumbs_parse_proximity_and_cloud_render() {
+        use crate::breadcrumbs::{BreadcrumbTrail, RecordOutcome, SpaceCoord};
+        use crate::models::ProximityZone;
+
+        let sample_1 = "Coordinates: x:-48118694104.272797 y:48503341985.968727 z:78519.184221";
+        let sample_2 = "Coordinates: x:-48118697936.058990 y:48503333471.106918 z:78517.358948";
+        let c1 = SpaceCoord::parse_showlocation(sample_1).expect("valid coord 1");
+        let c2 = SpaceCoord::parse_showlocation(sample_2).expect("valid coord 2");
+        let d_km = c1.distance_km(&c2);
+        assert!(
+            (d_km - 9.337).abs() < 0.05,
+            "expected ~9.34 km between pasted coordinates, got {:.3} km",
+            d_km
+        );
+
+        let mut trail = BreadcrumbTrail::default();
+        let t0 = Utc::now();
+        // 1st point -> Clear
+        match trail.record(c1, 5.0, None, t0) {
+            RecordOutcome::Recorded { proximity, .. } => {
+                assert_eq!(proximity.zone, ProximityZone::Clear);
+            }
+            RecordOutcome::Duplicate => panic!("first point should not be duplicate"),
+        }
+        // Duplicate (< 1m) -> ignored
+        assert_eq!(trail.record(c1, 5.0, None, t0), RecordOutcome::Duplicate);
+        // 2nd point ~9.34 km away with 5 km radius -> Clear (> 8 km approach)
+        match trail.record(c2, 5.0, None, t0 + Duration::minutes(5)) {
+            RecordOutcome::Recorded { proximity, .. } => {
+                assert_eq!(proximity.zone, ProximityZone::Clear);
+            }
+            RecordOutcome::Duplicate => panic!("second point should be recorded"),
+        }
+        // 3rd point 6.5 km from c1 -> Approaching (between 5 km and 8 km)
+        let c3 = SpaceCoord::new(c1.x + 6500.0, c1.y, c1.z);
+        match trail.record(c3, 5.0, None, t0 + Duration::minutes(8)) {
+            RecordOutcome::Recorded { proximity, .. } => {
+                assert_eq!(proximity.zone, ProximityZone::Approaching);
+            }
+            RecordOutcome::Duplicate => panic!("third point should be recorded"),
+        }
+        // 4th point 2.0 km from c1 -> Visited (<= 5 km)
+        let c4 = SpaceCoord::new(c1.x + 2000.0, c1.y, c1.z);
+        match trail.record(c4, 5.0, None, t0 + Duration::minutes(12)) {
+            RecordOutcome::Recorded { proximity, .. } => {
+                assert_eq!(proximity.zone, ProximityZone::Visited);
+                assert_eq!(proximity.nearest_id, Some(1));
+            }
+            RecordOutcome::Duplicate => panic!("fourth point should be recorded"),
+        }
+
+        // Verify SoftwareOverlayPainter renders the color cloud + radar card cleanly
+        let settings = AppSettings::default();
+        let social = SocialConfig::default();
+        let model = TestOverlayBuilder::build(
+            &social,
+            1920.0,
+            1080.0,
+            None,
+            TestOverlayPart::Breadcrumbs,
+            Some(&settings),
+        );
+        assert!(!model.is_empty());
+        let mut painter = SoftwareOverlayPainter::new();
+        let bgra = painter.paint(&model, &settings, 1920, 1080);
+        let visible = bgra.chunks_exact(4).filter(|px| px[3] > 0).count();
+        assert!(visible > 2000, "expected visible breadcrumb cloud pixels, got {}", visible);
+        // Premultiplied BGRA8 invariant (B, G, R <= A)
+        assert!(bgra
+            .chunks_exact(4)
+            .all(|px| px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]));
+
+        // Verify r_DisplayInfo OCR parsing (exact lines from Star Citizen r_DisplayInfo 3)
+        let di_sample = "\
+            CamDir: -47 22 -129 HOF: 11\n\
+            Zone: rs_refinery_pyro Pos: -17.75m 5.55m -17.46m\n\
+            Zone: solarsystem_4254651523815 Pos: -16111907.1877km 45541999.9767km -90.6115km\n\
+            Zone: Root Pos: -16111907.1877km 45541999.9767km -90.6115km";
+        let (parsed, dual) = SpaceCoord::parse_display_info(di_sample).expect("parse display info");
+        assert!(dual, "expected dual-line confirmation");
+        assert!((parsed.x - (-16_111_907_187.7)).abs() < 1.0);
+        assert!((parsed.y - 45_541_999_976.7).abs() < 1.0);
+        assert!((parsed.z - (-90_611.5)).abs() < 1.0);
+
+        // Verify DisplayInfoStabilizer rejects single-frame OCR glitches
+        let mut stab = crate::breadcrumbs::DisplayInfoStabilizer::default();
+        assert!(stab.ingest(parsed, true, t0).is_some());
+        let glitch = SpaceCoord::new(parsed.x + 500_000.0, parsed.y, parsed.z);
+        assert!(
+            stab.ingest(glitch, false, t0 + Duration::seconds(4)).is_none(),
+            "single-frame 500 km glitch must be rejected"
+        );
+        let smooth_move = SpaceCoord::new(parsed.x + 1200.0, parsed.y + 400.0, parsed.z);
+        assert!(stab
+            .ingest(smooth_move, false, t0 + Duration::seconds(8))
+            .is_some());
+        assert!(stab.should_auto_drop(parsed, 30, t0));
+        assert!(!stab.should_auto_drop(smooth_move, 30, t0 + Duration::seconds(10)));
+        assert!(stab.should_auto_drop(smooth_move, 30, t0 + Duration::seconds(31)));
     }
 
     #[test]

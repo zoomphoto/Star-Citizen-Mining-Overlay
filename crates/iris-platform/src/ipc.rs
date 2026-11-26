@@ -13,6 +13,7 @@ pub enum IpcCommand {
     ToggleDebugOverlay,
     TimedOverlay,
     InteractiveOverlay,
+    ClearBreadcrumbs,
     Quit,
 }
 
@@ -24,6 +25,7 @@ impl IpcCommand {
             IpcCommand::ToggleDebugOverlay => "debug",
             IpcCommand::TimedOverlay => "timed",
             IpcCommand::InteractiveOverlay => "interactive",
+            IpcCommand::ClearBreadcrumbs => "clear_breadcrumbs",
             IpcCommand::Quit => "quit",
         }
     }
@@ -35,6 +37,7 @@ impl IpcCommand {
             "debug" => Some(IpcCommand::ToggleDebugOverlay),
             "timed" => Some(IpcCommand::TimedOverlay),
             "interactive" => Some(IpcCommand::InteractiveOverlay),
+            "clear_breadcrumbs" => Some(IpcCommand::ClearBreadcrumbs),
             "quit" => Some(IpcCommand::Quit),
             _ => None,
         }

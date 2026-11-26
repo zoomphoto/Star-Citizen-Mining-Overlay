@@ -4,8 +4,9 @@ use crate::config::social::{
     SocialConfig,
 };
 use crate::models::{
-    BracketItem, ColorMatch, DebugBoxKind, DebugCandidateBox, DebugOverlayInfo, DebugStatusLevel,
-    MatchKind, OrgMembership, OverlayModel, PanelEntry, PanelOrgs, PixelRect,
+    BracketItem, BreadcrumbOverlayInfo, BreadcrumbRenderPoint, ColorMatch, DebugBoxKind,
+    DebugCandidateBox, DebugOverlayInfo, DebugStatusLevel, MatchKind, OrgMembership, OverlayModel,
+    PanelEntry, PanelOrgs, PixelRect, ProximityZone,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -865,6 +866,7 @@ pub enum TestOverlayPart {
     Boundary,
     Panel,
     DebugHud,
+    Breadcrumbs,
 }
 
 pub struct TestOverlayBuilder;
@@ -1032,6 +1034,7 @@ impl TestOverlayBuilder {
                     boundary_rect: None,
                     dossier_placeholder,
                     debug_info: None,
+                    breadcrumb_info: None,
                 }
             }
             TestOverlayPart::Boundary => OverlayModel {
@@ -1045,6 +1048,7 @@ impl TestOverlayBuilder {
                 boundary_rect: Some(area.to_pixels(screen_width, screen_height)),
                 dossier_placeholder: None,
                 debug_info: None,
+                breadcrumb_info: None,
             },
             TestOverlayPart::DebugHud => {
                 let show_cands = settings.map(|s| s.debug_show_candidates).unwrap_or(false);
@@ -1092,6 +1096,83 @@ impl TestOverlayBuilder {
                         heartbeat_phase: 0,
                         candidate_boxes,
                         scan_boundary,
+                    }),
+                    breadcrumb_info: None,
+                }
+            }
+            TestOverlayPart::Breadcrumbs => {
+                let radius = settings
+                    .map(|s| s.breadcrumbs_visited_radius_km as f64)
+                    .unwrap_or(5.0);
+                let show_cloud = settings.map(|s| s.breadcrumbs_screen_cloud).unwrap_or(true);
+                OverlayModel {
+                    window_width: screen_width as i32,
+                    window_height: screen_height as i32,
+                    brackets: Vec::new(),
+                    panel_entries: Vec::new(),
+                    mining_labels: Vec::new(),
+                    toast: None,
+                    note: None,
+                    boundary_rect: None,
+                    dossier_placeholder: None,
+                    debug_info: None,
+                    breadcrumb_info: Some(BreadcrumbOverlayInfo {
+                        zone: ProximityZone::Visited,
+                        headline: "VISITED CLOUD - 2.1 km from #3 (14m ago)".to_string(),
+                        subline: format!("6 pts  |  Cloud {:.0} km  |  dZ +0.2 km", radius),
+                        visited_radius_km: radius,
+                        heading_rad: Some(0.65),
+                        show_screen_cloud: show_cloud,
+                        points: vec![
+                            BreadcrumbRenderPoint {
+                                id: 1,
+                                dx_km: -9.5,
+                                dy_km: -6.0,
+                                dz_km: -0.4,
+                                age_mins: 32,
+                                is_current: false,
+                            },
+                            BreadcrumbRenderPoint {
+                                id: 2,
+                                dx_km: -5.2,
+                                dy_km: -1.8,
+                                dz_km: -0.1,
+                                age_mins: 24,
+                                is_current: false,
+                            },
+                            BreadcrumbRenderPoint {
+                                id: 3,
+                                dx_km: -1.6,
+                                dy_km: 1.4,
+                                dz_km: 0.0,
+                                age_mins: 14,
+                                is_current: false,
+                            },
+                            BreadcrumbRenderPoint {
+                                id: 4,
+                                dx_km: 4.5,
+                                dy_km: 5.0,
+                                dz_km: 0.3,
+                                age_mins: 9,
+                                is_current: false,
+                            },
+                            BreadcrumbRenderPoint {
+                                id: 5,
+                                dx_km: 3.0,
+                                dy_km: -2.5,
+                                dz_km: -0.2,
+                                age_mins: 4,
+                                is_current: false,
+                            },
+                            BreadcrumbRenderPoint {
+                                id: 6,
+                                dx_km: 0.0,
+                                dy_km: 0.0,
+                                dz_km: 0.0,
+                                age_mins: 0,
+                                is_current: true,
+                            },
+                        ],
                     }),
                 }
             }

@@ -428,6 +428,7 @@ impl LiveDetectionPipeline {
             boundary_rect: None,
             dossier_placeholder: None,
             debug_info: None,
+            breadcrumb_info: None,
         };
 
         let roster = InteractiveRoster::build(&self.tracker, now_ms);

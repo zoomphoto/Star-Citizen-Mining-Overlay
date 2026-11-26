@@ -379,6 +379,44 @@ pub struct DebugOverlayInfo {
     pub scan_boundary: Option<PixelRect>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ProximityZone {
+    Clear,
+    Approaching,
+    Visited,
+}
+
+impl ProximityZone {
+    pub const fn rgb(&self) -> (u8, u8, u8) {
+        match self {
+            ProximityZone::Clear => (0x00, 0xE5, 0xFF),
+            ProximityZone::Approaching => (0xFF, 0xA8, 0x00),
+            ProximityZone::Visited => (0xFF, 0x3B, 0x30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BreadcrumbRenderPoint {
+    pub id: u64,
+    pub dx_km: f64,
+    pub dy_km: f64,
+    pub dz_km: f64,
+    pub age_mins: u32,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BreadcrumbOverlayInfo {
+    pub zone: ProximityZone,
+    pub headline: String,
+    pub subline: String,
+    pub visited_radius_km: f64,
+    pub heading_rad: Option<f64>,
+    pub show_screen_cloud: bool,
+    pub points: Vec<BreadcrumbRenderPoint>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct OverlayModel {
     pub window_width: i32,
@@ -391,6 +429,7 @@ pub struct OverlayModel {
     pub boundary_rect: Option<PixelRect>,
     pub dossier_placeholder: Option<PixelRect>,
     pub debug_info: Option<DebugOverlayInfo>,
+    pub breadcrumb_info: Option<BreadcrumbOverlayInfo>,
 }
 
 impl OverlayModel {
@@ -403,5 +442,6 @@ impl OverlayModel {
             && self.boundary_rect.is_none()
             && self.dossier_placeholder.is_none()
             && self.debug_info.is_none()
+            && self.breadcrumb_info.is_none()
     }
 }
