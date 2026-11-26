@@ -7,7 +7,8 @@ use std::thread;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
+    VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW,
@@ -20,6 +21,7 @@ struct ActiveBindings {
     toggle: Option<HotkeyChord>,
     timed: Option<HotkeyChord>,
     interactive: Option<HotkeyChord>,
+    save_waypoint: Option<HotkeyChord>,
 }
 
 struct HookGlobalState {
@@ -83,6 +85,7 @@ impl Win32HotkeyListener {
             toggle: HotkeyText::parse(&settings.hotkey_toggle_overlay).ok(),
             timed: HotkeyText::parse(&settings.hotkey_timed_overlay).ok(),
             interactive: HotkeyText::parse(&settings.hotkey_interactive_overlay).ok(),
+            save_waypoint: HotkeyText::parse(&settings.hotkey_save_waypoint).ok(),
         }
     }
 }
@@ -133,9 +136,16 @@ unsafe extern "system" fn low_level_kbd_proc(
                 // Ignore auto-repeat so holding `Tab` doesn't spam restarts
                 if !was_down {
                     if let Some(key_name) = vk_to_hotkey_name(kb.vkCode) {
-                        let ctrl = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
-                        let alt = (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
-                        let shift = (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+                        let ctrl = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+                            || (GetAsyncKeyState(VK_LCONTROL.0 as i32) as u16 & 0x8000) != 0
+                            || (GetAsyncKeyState(VK_RCONTROL.0 as i32) as u16 & 0x8000) != 0;
+                        let alt = (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
+                            || (GetAsyncKeyState(VK_LMENU.0 as i32) as u16 & 0x8000) != 0
+                            || (GetAsyncKeyState(VK_RMENU.0 as i32) as u16 & 0x8000) != 0
+                            || (kb.flags.0 & 0x20) != 0;
+                        let shift = (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0
+                            || (GetAsyncKeyState(VK_LSHIFT.0 as i32) as u16 & 0x8000) != 0
+                            || (GetAsyncKeyState(VK_RSHIFT.0 as i32) as u16 & 0x8000) != 0;
 
                         let matches = |opt: &Option<HotkeyChord>| -> bool {
                             let Some(c) = opt else {
@@ -152,6 +162,8 @@ unsafe extern "system" fn low_level_kbd_proc(
                             let _ = state.tx.send(HotkeyAction::ToggleOverlay);
                         } else if matches(&guard.interactive) {
                             let _ = state.tx.send(HotkeyAction::InteractiveOverlay);
+                        } else if matches(&guard.save_waypoint) {
+                            let _ = state.tx.send(HotkeyAction::SaveWaypoint);
                         } else if matches(&guard.timed) {
                             let _ = state.tx.send(HotkeyAction::TimedOverlay);
                         }

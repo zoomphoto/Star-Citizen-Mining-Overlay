@@ -6,6 +6,7 @@ use crate::theme::{
 use eframe::egui::{
     self, Align, Key, Layout, Margin, RichText, Rounding, ScrollArea, Slider, Stroke, TextEdit,
 };
+use iris_core::breadcrumbs::SpaceCoord;
 use iris_core::config::{
     AppSettings, AttributeKind, AttributeTarget, CaptureMethod, ColorRanks, DarkMode,
     HostedConfigUrl, HotkeyChord, HotkeyText, ImportMode, OrgDisplay, OrgVocabulary,
@@ -14,6 +15,7 @@ use iris_core::config::{
 use iris_core::lookup::RsiNames;
 use iris_core::models::OverlayColor;
 use iris_core::overlay::{GameWindowRules, GameWindowState, TestOverlayPart};
+use iris_core::waypoints::format_distance_m;
 use iris_platform::{open_folder_or_file, open_https_url};
 use std::fs;
 use std::sync::atomic::Ordering;
@@ -24,6 +26,7 @@ pub enum SettingsTab {
     Players,
     Orgs,
     OrgAttribute,
+    Waypoints,
     Settings,
 }
 
@@ -32,6 +35,7 @@ enum RecordingHotkey {
     Toggle,
     Timed,
     Interactive,
+    SaveWaypoint,
 }
 
 pub struct SettingsWindowState {
@@ -42,6 +46,13 @@ pub struct SettingsWindowState {
     new_org_sid: String,
     new_org_color: OverlayColor,
     org_filter: String,
+    new_poi_name: String,
+    new_poi_color: OverlayColor,
+    paste_poi_coords: String,
+    poi_filter: String,
+    editing_poi_id: Option<String>,
+    editing_poi_name: String,
+    editing_poi_notes: String,
     hosted_url_draft: String,
     hosted_url_initialized: bool,
     recording_hotkey: Option<RecordingHotkey>,
@@ -63,6 +74,13 @@ impl SettingsWindowState {
             new_org_sid: String::new(),
             new_org_color: OverlayColor::Red,
             org_filter: String::new(),
+            new_poi_name: String::new(),
+            new_poi_color: OverlayColor::Cyan,
+            paste_poi_coords: String::new(),
+            poi_filter: String::new(),
+            editing_poi_id: None,
+            editing_poi_name: String::new(),
+            editing_poi_notes: String::new(),
             hosted_url_draft: String::new(),
             hosted_url_initialized: false,
             recording_hotkey: None,
@@ -95,6 +113,7 @@ impl SettingsWindowState {
             SettingsTab::Players => self.render_players_tab(ui, p, shared),
             SettingsTab::Orgs => self.render_orgs_tab(ui, p, shared),
             SettingsTab::OrgAttribute => self.render_org_attribute_tab(ui, p, shared),
+            SettingsTab::Waypoints => self.render_waypoints_tab(ui, p, shared),
             SettingsTab::Settings => self.render_settings_tab(ui, p, shared),
         }
     }
@@ -252,6 +271,7 @@ impl SettingsWindowState {
                         (SettingsTab::Players, "{ } Players"),
                         (SettingsTab::Orgs, "[ ] Orgs"),
                         (SettingsTab::OrgAttribute, "< > Org-Attribute"),
+                        (SettingsTab::Waypoints, "⌖ POIs / Beacons"),
                         (SettingsTab::Settings, "⚙ Settings"),
                     ];
                     for (tab, label) in tabs {
@@ -886,7 +906,477 @@ impl SettingsWindowState {
     }
 
     // ========================================================================
-    // Tab 4: Settings
+    // Tab 4: POIs / Waypoint Beacons
+    // ========================================================================
+    fn render_waypoints_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &ThemePalette,
+        shared: &Arc<AppSharedState>,
+    ) {
+        let save_hk = shared.settings.read().hotkey_save_waypoint.clone();
+        let live_fix = shared.last_position_fix.read().clone();
+
+        // Top Bar: Current Position + Quick Save + Paste /showlocation + Import/Export
+        egui::Frame::none()
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0, p.border))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let (pos_txt, pos_col) = if let Some((disp, _key, c)) = &live_fix.body {
+                        (
+                            format!(
+                                "● Zone Lock [{}]: {:.1} km, {:.1} km, {:.1} km (zero rotation drift)",
+                                disp,
+                                c.x / 1000.0,
+                                c.y / 1000.0,
+                                c.z / 1000.0
+                            ),
+                            p.success,
+                        )
+                    } else if let Some(c) = live_fix.root {
+                        let z_part = live_fix
+                            .display_zone
+                            .as_deref()
+                            .map(|z| format!(" [{}]", z))
+                            .unwrap_or_else(|| " [Deep Space]".to_string());
+                        (
+                            format!(
+                                "● Position Lock{}: {:.1} km, {:.1} km, {:.1} km",
+                                z_part,
+                                c.x / 1000.0,
+                                c.y / 1000.0,
+                                c.z / 1000.0
+                            ),
+                            p.success,
+                        )
+                    } else {
+                        (
+                            "○ No Position Lock (enable r_DisplayInfo 2/3 or run /showlocation)"
+                                .to_string(),
+                            p.muted,
+                        )
+                    };
+                    ui.label(RichText::new(pos_txt).size(12.5).color(pos_col));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("In-game hotkey: {}", save_hk))
+                                .monospace()
+                                .size(12.0)
+                                .color(p.accent),
+                        );
+                    });
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("POI Name:").color(p.muted));
+                    let name_resp = ui.add(
+                        TextEdit::singleline(&mut self.new_poi_name)
+                            .desired_width(210.0)
+                            .hint_text("Optional name (defaults to POI #N)…"),
+                    );
+                    let enter = name_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+
+                    color_combo(ui, "new_poi_color", &mut self.new_poi_color, p.is_dark);
+
+                    if ui
+                        .button("＋ Save Current Position")
+                        .on_hover_text("Save your current Star Citizen coordinates as a POI beacon")
+                        .clicked()
+                        || enter
+                    {
+                        let trimmed = self.new_poi_name.trim().to_string();
+                        let opt_name = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        };
+                        let _ = shared.coordinator_tx.send(CoordinatorCommand::SaveWaypoint {
+                            name: opt_name,
+                            color: Some(self.new_poi_color),
+                        });
+                        self.new_poi_name.clear();
+                    }
+
+                    if ui
+                        .button("👁 Preview HUD Marker (15s)")
+                        .on_hover_text("Preview the directional waypoint compass & ring marker on your desktop")
+                        .clicked()
+                    {
+                        let _ = shared
+                            .coordinator_tx
+                            .send(CoordinatorCommand::ShowTestOverlay(TestOverlayPart::Waypoint));
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Paste Coords:").color(p.muted));
+                    let paste_resp = ui.add(
+                        TextEdit::singleline(&mut self.paste_poi_coords)
+                            .desired_width(300.0)
+                            .hint_text("Coordinates: x:... y:... z:... (from /showlocation)"),
+                    );
+                    let enter = paste_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    if ui
+                        .button("＋ Add from Coords")
+                        .on_hover_text("Create a POI directly from pasted /showlocation coordinates")
+                        .clicked()
+                        || enter
+                    {
+                        if let Some(coord) = SpaceCoord::parse_showlocation(&self.paste_poi_coords)
+                            .or_else(|| {
+                                SpaceCoord::parse_display_info(&self.paste_poi_coords)
+                                    .map(|(c, _)| c)
+                            })
+                        {
+                            let trimmed = self.new_poi_name.trim().to_string();
+                            let opt_name = if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed)
+                            };
+                            let wp = shared.waypoints.write().add_point(
+                                coord,
+                                opt_name,
+                                None,
+                                None,
+                                Some(self.new_poi_color),
+                                chrono::Utc::now(),
+                            );
+                            shared.save_waypoints();
+                            shared.set_status(format!("Added POI \"{}\".", wp.name), false);
+                            self.paste_poi_coords.clear();
+                            self.new_poi_name.clear();
+                        } else {
+                            shared.set_status(
+                                "Could not parse coordinates. Paste a /showlocation line (x:... y:... z:...).",
+                                true,
+                            );
+                        }
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("📤 Export JSON…").clicked() {
+                            self.export_waypoints_dialog(shared);
+                        }
+                        if ui.small_button("📥 Import JSON…").clicked() {
+                            self.import_waypoints_dialog(shared);
+                        }
+                        ui.add(
+                            TextEdit::singleline(&mut self.poi_filter)
+                                .desired_width(145.0)
+                                .hint_text("Filter POIs…"),
+                        );
+                    });
+                });
+            });
+
+        ui.add_space(8.0);
+
+        let store_snap = shared.waypoints.read().clone();
+        let active_id = store_snap.active_waypoint_id.clone();
+
+        // Active Beacon highlight bar
+        if let Some(active_wp) = store_snap.active() {
+            let c32 = overlay_color32(active_wp.color);
+            let dist_txt = live_fix
+                .distance_to_waypoint_m(active_wp)
+                .map(|(d, locked)| {
+                    if locked {
+                        format!(
+                            " • {} away (Zone Locked: {})",
+                            format_distance_m(d),
+                            active_wp.local_zone.as_deref().unwrap_or("")
+                        )
+                    } else {
+                        format!(" • {} away", format_distance_m(d))
+                    }
+                })
+                .unwrap_or_else(|| " • Waiting for live position".to_string());
+            egui::Frame::none()
+                .fill(c32.gamma_multiply(0.14))
+                .stroke(Stroke::new(1.2, c32))
+                .rounding(Rounding::same(6.0))
+                .inner_margin(Margin::symmetric(10.0, 7.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(quantico_text("ACTIVE BEACON:", 13.0, c32));
+                        ui.label(RichText::new(&active_wp.name).strong().size(14.0).color(p.text));
+                        ui.label(RichText::new(dist_txt).size(12.5).color(p.muted));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("✕ Unload Beacon").clicked() {
+                                shared.waypoints.write().set_active(None);
+                                shared.save_waypoints();
+                            }
+                        });
+                    });
+                });
+            ui.add_space(6.0);
+        }
+
+        let filter_q = self.poi_filter.trim().to_ascii_lowercase();
+        let filtered: Vec<_> = store_snap
+            .waypoints
+            .iter()
+            .rev()
+            .filter(|w| {
+                filter_q.is_empty()
+                    || w.name.to_ascii_lowercase().contains(&filter_q)
+                    || w.zone
+                        .as_deref()
+                        .is_some_and(|z| z.to_ascii_lowercase().contains(&filter_q))
+                    || w.notes
+                        .as_deref()
+                        .is_some_and(|n| n.to_ascii_lowercase().contains(&filter_q))
+            })
+            .cloned()
+            .collect();
+
+        ui.label(
+            RichText::new(format!(
+                "Showing {} of {} saved POIs (stored in Config/waypoints.json — press {} in-game to drop a point)",
+                filtered.len(),
+                store_snap.waypoints.len(),
+                save_hk
+            ))
+            .size(12.0)
+            .color(p.muted),
+        );
+        ui.add_space(4.0);
+
+        let mut load_id: Option<Option<String>> = None;
+        let mut color_updates: Vec<(String, OverlayColor)> = Vec::new();
+        let mut rename_commit: Option<(String, String, String)> = None;
+        let mut removals: Vec<String> = Vec::new();
+
+        ScrollArea::vertical()
+            .id_salt("waypoints_tab_scroll")
+            .show(ui, |ui| {
+                if filtered.is_empty() {
+                    egui::Frame::none()
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::same(16.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "No POIs saved yet. Press Alt+Shift+P while flying in Star Citizen (with r_DisplayInfo 2/3 or /showlocation) to drop a custom beacon, then load it here for live directional HUD guidance.",
+                                )
+                                .color(p.muted),
+                            );
+                        });
+                }
+
+                for wp in filtered {
+                    let is_active = active_id.as_deref() == Some(wp.id.as_str());
+                    let is_editing = self.editing_poi_id.as_deref() == Some(wp.id.as_str());
+                    let c32 = overlay_color32(wp.color);
+
+                    egui::Frame::none()
+                        .fill(p.surface)
+                        .stroke(Stroke::new(if is_active { 1.4 } else { 1.0 }, if is_active { c32 } else { p.border }))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::symmetric(10.0, 7.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if is_editing {
+                                    let r = ui.add(
+                                        TextEdit::singleline(&mut self.editing_poi_name)
+                                            .desired_width(180.0)
+                                            .hint_text("POI Name"),
+                                    );
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.editing_poi_notes)
+                                            .desired_width(210.0)
+                                            .hint_text("Optional notes…"),
+                                    );
+                                    let enter =
+                                        r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                                    if ui.small_button("Save").clicked() || enter {
+                                        rename_commit = Some((
+                                            wp.id.clone(),
+                                            self.editing_poi_name.clone(),
+                                            self.editing_poi_notes.clone(),
+                                        ));
+                                        self.editing_poi_id = None;
+                                    }
+                                    if ui.small_button("Cancel").clicked() {
+                                        self.editing_poi_id = None;
+                                    }
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!("◆ {}", wp.name))
+                                            .strong()
+                                            .size(14.0)
+                                            .color(c32),
+                                    );
+                                    if let Some((d_m, locked)) = live_fix.distance_to_waypoint_m(&wp)
+                                    {
+                                        let d = format_distance_m(d_m);
+                                        ui.label(
+                                            RichText::new(d)
+                                                .monospace()
+                                                .strong()
+                                                .size(12.5)
+                                                .color(if locked { p.success } else { p.text }),
+                                        );
+                                    }
+                                    if let Some(lz) = &wp.local_zone {
+                                        ui.label(
+                                            RichText::new(format!("[ZONE: {}]", lz))
+                                                .size(11.5)
+                                                .color(p.accent),
+                                        );
+                                    } else if let Some(zone) = &wp.zone {
+                                        ui.label(
+                                            RichText::new(format!("[{}]", zone))
+                                                .size(11.5)
+                                                .color(p.muted),
+                                        );
+                                    }
+                                    let display_c = wp.local_coord.unwrap_or(wp.coord);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "({:.1}, {:.1}, {:.1} km)",
+                                            display_c.x / 1000.0,
+                                            display_c.y / 1000.0,
+                                            display_c.z / 1000.0
+                                        ))
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(p.muted),
+                                    );
+                                }
+
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .small_button(RichText::new("Delete").color(p.danger))
+                                        .clicked()
+                                    {
+                                        removals.push(wp.id.clone());
+                                    }
+                                    if !is_editing && ui.small_button("✎ Rename").clicked() {
+                                        self.editing_poi_id = Some(wp.id.clone());
+                                        self.editing_poi_name = wp.name.clone();
+                                        self.editing_poi_notes =
+                                            wp.notes.clone().unwrap_or_default();
+                                    }
+                                    let mut col = wp.color;
+                                    if color_combo(ui, ("wp_col", &wp.id), &mut col, p.is_dark) {
+                                        color_updates.push((wp.id.clone(), col));
+                                    }
+                                    if is_active {
+                                        if ui
+                                            .small_button(RichText::new("✓ Active").color(p.success))
+                                            .on_hover_text("Click to unload this beacon from the HUD")
+                                            .clicked()
+                                        {
+                                            load_id = Some(None);
+                                        }
+                                    } else if ui
+                                        .small_button(RichText::new("🎯 Load").color(p.accent))
+                                        .on_hover_text("Load this POI onto your HUD with live directional marker")
+                                        .clicked()
+                                    {
+                                        load_id = Some(Some(wp.id.clone()));
+                                    }
+                                });
+                            });
+                            if !is_editing {
+                                if let Some(notes) = &wp.notes {
+                                    ui.label(RichText::new(notes).size(11.5).color(p.muted));
+                                }
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+            });
+
+        let mut dirty = false;
+        if let Some(target_opt) = load_id {
+            shared.waypoints.write().set_active(target_opt.as_deref());
+            dirty = true;
+        }
+        if let Some((id, new_name, new_notes)) = rename_commit {
+            let mut store = shared.waypoints.write();
+            if store.rename(&id, &new_name) {
+                dirty = true;
+            }
+            if store.set_notes(&id, Some(new_notes)) {
+                dirty = true;
+            }
+        }
+        if !color_updates.is_empty() || !removals.is_empty() {
+            let mut store = shared.waypoints.write();
+            for (id, c) in color_updates {
+                if store.set_color(&id, c) {
+                    dirty = true;
+                }
+            }
+            for id in removals {
+                if store.remove(&id) {
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            shared.save_waypoints();
+        }
+    }
+
+    fn import_waypoints_dialog(&self, shared: &Arc<AppSharedState>) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import POIs / Waypoints JSON")
+            .add_filter("Waypoints JSON (*.json)", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                shared.set_status(format!("Failed reading {}: {}", path.display(), e), true);
+                return;
+            }
+        };
+        match shared.waypoints.write().import_json(&text) {
+            Ok(added) => {
+                shared.save_waypoints();
+                shared.set_status(format!("Imported {} new POI(s).", added), false);
+            }
+            Err(err) => shared.set_status(err, true),
+        }
+    }
+
+    fn export_waypoints_dialog(&self, shared: &Arc<AppSharedState>) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export POIs / Waypoints JSON")
+            .set_file_name("waypoints.json")
+            .add_filter("Waypoints JSON (*.json)", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        let json = match shared.waypoints.read().export_json() {
+            Ok(j) => j,
+            Err(err) => {
+                shared.set_status(err, true);
+                return;
+            }
+        };
+        match iris_core::config::AtomicFile::write_text(&path, &json, false) {
+            Ok(()) => shared.set_status(format!("Exported POIs to {}.", path.display()), false),
+            Err(e) => shared.set_status(format!("Export failed: {}", e), true),
+        }
+    }
+
+    // ========================================================================
+    // Tab 5: Settings
     // ========================================================================
     fn render_settings_tab(
         &mut self,
@@ -942,6 +1432,19 @@ impl SettingsWindowState {
                             );
                             if ui.small_button("Reset (Shift+0)").clicked() {
                                 s.hotkey_interactive_overlay = "Shift+0".to_string();
+                                changed = true;
+                            }
+                            ui.end_row();
+
+                            self.hotkey_row(
+                                ui,
+                                p,
+                                "Save POI / Waypoint Beacon:",
+                                &s.hotkey_save_waypoint,
+                                RecordingHotkey::SaveWaypoint,
+                            );
+                            if ui.small_button("Reset (Alt+Shift+P)").clicked() {
+                                s.hotkey_save_waypoint = "Alt+Shift+P".to_string();
                                 changed = true;
                             }
                             ui.end_row();
@@ -1747,6 +2250,53 @@ impl SettingsWindowState {
 
                 ui.add_space(10.0);
 
+                // 6c. Waypoint Beacons (Custom POIs)
+                Self::section_card(ui, p, "WAYPOINT BEACONS (CUSTOM POIs)", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .checkbox(&mut s.waypoints_enabled, "Enable Waypoint HUD Beacons")
+                            .on_hover_text(
+                                "Displays a top-center directional compass card and distance countdown for your loaded POI",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(10.0);
+                        if ui
+                            .add_enabled(
+                                s.waypoints_enabled,
+                                egui::Checkbox::new(
+                                    &mut s.waypoints_show_ring_marker,
+                                    "Show floating directional HUD ring marker",
+                                ),
+                            )
+                            .on_hover_text(
+                                "Places a glowing directional chevron + POI name + distance around your HUD pointing toward the active POI",
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        ui.add_space(10.0);
+                        if ui
+                            .button("👁 Preview Beacon HUD (15s)")
+                            .on_hover_text(
+                                "Preview the live directional waypoint HUD card and ring marker on your desktop",
+                            )
+                            .clicked()
+                        {
+                            let _ = shared.coordinator_tx.send(
+                                CoordinatorCommand::ShowTestOverlay(TestOverlayPart::Waypoint),
+                            );
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+
                 // 7. Cache, Theme & Diagnostics
                 Self::section_card(ui, p, "CACHE, APPEARANCE & FILES", |ui| {
                     ui.horizontal_wrapped(|ui| {
@@ -1969,6 +2519,7 @@ impl SettingsWindowState {
                             RecordingHotkey::Interactive => {
                                 s.hotkey_interactive_overlay = formatted
                             }
+                            RecordingHotkey::SaveWaypoint => s.hotkey_save_waypoint = formatted,
                         }
                     }
                     shared.save_settings(false);

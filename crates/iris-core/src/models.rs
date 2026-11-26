@@ -407,6 +407,14 @@ pub struct BreadcrumbRenderPoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BreadcrumbWaypointPin {
+    pub name: String,
+    pub dx_km: f64,
+    pub dy_km: f64,
+    pub color: OverlayColor,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BreadcrumbOverlayInfo {
     pub zone: ProximityZone,
     pub headline: String,
@@ -415,6 +423,34 @@ pub struct BreadcrumbOverlayInfo {
     pub heading_rad: Option<f64>,
     pub show_screen_cloud: bool,
     pub points: Vec<BreadcrumbRenderPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_waypoint: Option<BreadcrumbWaypointPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaypointOverlayInfo {
+    pub waypoint_id: String,
+    pub name: String,
+    pub color: OverlayColor,
+    pub has_position_fix: bool,
+    pub arrived: bool,
+    pub distance_m: f64,
+    pub distance_text: String,
+    pub steering_text: String,
+    pub vertical_text: String,
+    pub subline: String,
+    /// Relative horizontal angle to target in radians: 0 = ahead, <0 = right, >0 = left, +/-pi = behind.
+    pub rel_yaw_rad: Option<f64>,
+    /// Target Z minus current Z in meters (+ = above, - = below).
+    pub dz_m: f64,
+    /// Compass heading in Root XY plane (0..360 deg, 0 = +Y North, 90 = +X East).
+    pub world_bearing_deg: f64,
+    /// Positive when closing toward target (m/s), negative when moving away.
+    pub closing_mps: Option<f64>,
+    /// Set when tracking inside a rotating planet/moon local container (zero drift).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_lock: Option<String>,
+    pub show_ring_marker: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -425,11 +461,15 @@ pub struct OverlayModel {
     pub panel_entries: Vec<PanelEntry>,
     pub mining_labels: Vec<MiningLabelItem>,
     pub toast: Option<String>,
+    /// Prominent top-center HUD confirmation toast (e.g. POI saved confirmation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_toast: Option<String>,
     pub note: Option<String>,
     pub boundary_rect: Option<PixelRect>,
     pub dossier_placeholder: Option<PixelRect>,
     pub debug_info: Option<DebugOverlayInfo>,
     pub breadcrumb_info: Option<BreadcrumbOverlayInfo>,
+    pub waypoint_info: Option<WaypointOverlayInfo>,
 }
 
 impl OverlayModel {
@@ -438,10 +478,12 @@ impl OverlayModel {
             && self.panel_entries.is_empty()
             && self.mining_labels.is_empty()
             && self.toast.is_none()
+            && self.center_toast.is_none()
             && self.note.is_none()
             && self.boundary_rect.is_none()
             && self.dossier_placeholder.is_none()
             && self.debug_info.is_none()
             && self.breadcrumb_info.is_none()
+            && self.waypoint_info.is_none()
     }
 }

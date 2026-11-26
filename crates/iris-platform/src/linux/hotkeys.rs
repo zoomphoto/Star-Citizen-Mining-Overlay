@@ -17,6 +17,7 @@ struct ActiveBindings {
     toggle: Option<HotkeyChord>,
     timed: Option<HotkeyChord>,
     interactive: Option<HotkeyChord>,
+    save_waypoint: Option<HotkeyChord>,
 }
 
 pub struct LinuxHotkeyListener {
@@ -55,6 +56,7 @@ impl LinuxHotkeyListener {
             toggle: HotkeyText::parse(&settings.hotkey_toggle_overlay).ok(),
             timed: HotkeyText::parse(&settings.hotkey_timed_overlay).ok(),
             interactive: HotkeyText::parse(&settings.hotkey_interactive_overlay).ok(),
+            save_waypoint: HotkeyText::parse(&settings.hotkey_save_waypoint).ok(),
         }
     }
 
@@ -144,6 +146,8 @@ impl LinuxHotkeyListener {
                                                 } else if matches(&guard.interactive) {
                                                     let _ =
                                                         tx.send(HotkeyAction::InteractiveOverlay);
+                                                } else if matches(&guard.save_waypoint) {
+                                                    let _ = tx.send(HotkeyAction::SaveWaypoint);
                                                 } else if matches(&guard.timed) {
                                                     let _ = tx.send(HotkeyAction::TimedOverlay);
                                                 }
@@ -193,6 +197,10 @@ impl LinuxHotkeyListener {
                             .preferred_trigger(Some(
                                 to_xdg_trigger(&settings.hotkey_interactive_overlay).as_str(),
                             )),
+                        NewShortcut::new("save-waypoint", "Save Current POI Waypoint")
+                            .preferred_trigger(Some(
+                                to_xdg_trigger(&settings.hotkey_save_waypoint).as_str(),
+                            )),
                     ];
                     // Only bind timed-overlay in XDG portal if it uses a modifier (so bare `Tab` isn't eaten!)
                     if let Ok(chord) = HotkeyText::parse(&settings.hotkey_timed_overlay) {
@@ -220,6 +228,9 @@ impl LinuxHotkeyListener {
                                 }
                                 "interactive-overlay" => {
                                     let _ = tx.send(HotkeyAction::InteractiveOverlay);
+                                }
+                                "save-waypoint" => {
+                                    let _ = tx.send(HotkeyAction::SaveWaypoint);
                                 }
                                 _ => {}
                             }

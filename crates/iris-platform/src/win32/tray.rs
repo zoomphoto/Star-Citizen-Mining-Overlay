@@ -34,6 +34,7 @@ const ID_CONFIG: usize = 1004;
 const ID_QUIT: usize = 1005;
 const ID_DEBUG: usize = 1006;
 const ID_CLEAR_BREADCRUMBS: usize = 1007;
+const ID_SAVE_WAYPOINT: usize = 1008;
 
 struct TrayThreadShared {
     overlay_enabled: Arc<AtomicBool>,
@@ -269,6 +270,7 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
     let w_settings: Vec<u16> = "Settings…\0".encode_utf16().collect();
     let w_toggle: Vec<u16> = toggle_label.encode_utf16().collect();
     let w_debug: Vec<u16> = debug_label.encode_utf16().collect();
+    let w_save_poi: Vec<u16> = "Save POI at Current Position\0".encode_utf16().collect();
     let w_clear_trail: Vec<u16> = "Clear Breadcrumb Trail\0".encode_utf16().collect();
     let w_logs: Vec<u16> = "Open log folder\0".encode_utf16().collect();
     let w_cfg: Vec<u16> = "Open config location\0".encode_utf16().collect();
@@ -277,6 +279,12 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
     let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, PCWSTR(w_settings.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, PCWSTR(w_toggle.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, ID_DEBUG, PCWSTR(w_debug.as_ptr()));
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_SAVE_WAYPOINT,
+        PCWSTR(w_save_poi.as_ptr()),
+    );
     let _ = AppendMenuW(
         menu,
         MF_STRING,
@@ -313,6 +321,9 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
         }
         ID_DEBUG => {
             let _ = shared.tx.send(TrayAction::ToggleDebugOverlay);
+        }
+        ID_SAVE_WAYPOINT => {
+            let _ = shared.tx.send(TrayAction::SaveWaypoint);
         }
         ID_CLEAR_BREADCRUMBS => {
             let _ = shared.tx.send(TrayAction::ClearBreadcrumbs);

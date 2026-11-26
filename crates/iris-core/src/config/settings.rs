@@ -64,6 +64,7 @@ pub struct AppSettings {
     pub hotkey_toggle_overlay: String,
     pub hotkey_timed_overlay: String,
     pub hotkey_interactive_overlay: String,
+    pub hotkey_save_waypoint: String,
     pub timed_overlay_seconds: i32,
     pub mining_disabled: bool,
     pub mining_label_zoom_percent: i32,
@@ -73,6 +74,8 @@ pub struct AppSettings {
     pub breadcrumbs_screen_cloud: bool,
     pub breadcrumbs_auto_displayinfo: bool,
     pub breadcrumbs_auto_interval_secs: i32,
+    pub waypoints_enabled: bool,
+    pub waypoints_show_ring_marker: bool,
     pub debug_overlay_enabled: bool,
     pub debug_show_candidates: bool,
     /// Linux XDG ScreenCast portal restore token so Bazzite Wayland only prompts once
@@ -147,6 +150,7 @@ impl Default for AppSettings {
             hotkey_toggle_overlay: "Shift+F12".to_string(),
             hotkey_timed_overlay: "Tab".to_string(),
             hotkey_interactive_overlay: "Shift+0".to_string(),
+            hotkey_save_waypoint: "Alt+Shift+P".to_string(),
             timed_overlay_seconds: 10,
             mining_disabled: false,
             mining_label_zoom_percent: 150,
@@ -156,6 +160,8 @@ impl Default for AppSettings {
             breadcrumbs_screen_cloud: true,
             breadcrumbs_auto_displayinfo: true,
             breadcrumbs_auto_interval_secs: 15,
+            waypoints_enabled: true,
+            waypoints_show_ring_marker: true,
             debug_overlay_enabled: false,
             debug_show_candidates: false,
             linux_portal_restore_token: String::new(),
@@ -330,6 +336,10 @@ impl AppSettingsToml {
             quote(&HotkeyText::normalize(&settings.hotkey_interactive_overlay))
         ));
         out.push_str(&format!(
+            "hotkey_save_waypoint = {}\n",
+            quote(&HotkeyText::normalize(&settings.hotkey_save_waypoint))
+        ));
+        out.push_str(&format!(
             "timed_overlay_seconds = {}\n",
             settings
                 .timed_overlay_seconds
@@ -377,6 +387,14 @@ impl AppSettingsToml {
                 AppSettings::BREADCRUMB_INTERVAL_MIN_SECS,
                 AppSettings::BREADCRUMB_INTERVAL_MAX_SECS
             )
+        ));
+        out.push_str(&format!(
+            "waypoints_enabled = {}\n",
+            bool_str(settings.waypoints_enabled)
+        ));
+        out.push_str(&format!(
+            "waypoints_show_ring_marker = {}\n",
+            bool_str(settings.waypoints_show_ring_marker)
         ));
         out.push_str(&format!(
             "debug_overlay_enabled = {}\n",
@@ -674,6 +692,12 @@ impl AppSettingsToml {
             &defaults.hotkey_interactive_overlay,
             &mut warnings,
         );
+        s.hotkey_save_waypoint = read_hotkey(
+            &root,
+            "hotkey_save_waypoint",
+            &defaults.hotkey_save_waypoint,
+            &mut warnings,
+        );
         s.timed_overlay_seconds = read_int(
             &root,
             "timed_overlay_seconds",
@@ -735,6 +759,18 @@ impl AppSettingsToml {
             defaults.breadcrumbs_auto_interval_secs,
             AppSettings::BREADCRUMB_INTERVAL_MIN_SECS,
             AppSettings::BREADCRUMB_INTERVAL_MAX_SECS,
+            &mut warnings,
+        );
+        s.waypoints_enabled = read_bool(
+            &root,
+            "waypoints_enabled",
+            defaults.waypoints_enabled,
+            &mut warnings,
+        );
+        s.waypoints_show_ring_marker = read_bool(
+            &root,
+            "waypoints_show_ring_marker",
+            defaults.waypoints_show_ring_marker,
             &mut warnings,
         );
         s.debug_overlay_enabled = read_bool(

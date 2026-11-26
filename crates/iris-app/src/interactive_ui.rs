@@ -1,5 +1,5 @@
-use crate::state::AppSharedState;
-use crate::theme::{overlay_color32, quantico_text, ThemePalette};
+use crate::state::{AppSharedState, CoordinatorCommand};
+use crate::theme::{color_combo, overlay_color32, quantico_text, ThemePalette};
 use chrono::Utc;
 use eframe::egui::{
     self, Align, Color32, Key, Layout, Margin, Pos2, RichText, Rounding, ScrollArea, Stroke,
@@ -9,18 +9,30 @@ use iris_core::config::ColorResolver;
 use iris_core::lookup::RsiNames;
 use iris_core::models::{MatchKind, OrgMembership, OverlayColor};
 use iris_core::overlay::DossierText;
+use iris_core::waypoints::format_distance_m;
 use iris_platform::open_https_url;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveView {
+    Dossier,
+    Waypoints,
+}
+
 pub struct InteractiveOverlayState {
+    active_view: InteractiveView,
     search_query: String,
     selected_handle: Option<String>,
     note_draft_handle: Option<String>,
     note_draft_text: String,
     fetched_profiles_this_open: HashSet<String>,
     was_open: bool,
+    new_poi_name: String,
+    new_poi_color: OverlayColor,
+    editing_poi_id: Option<String>,
+    editing_poi_name: String,
 }
 
 impl Default for InteractiveOverlayState {
@@ -32,12 +44,17 @@ impl Default for InteractiveOverlayState {
 impl InteractiveOverlayState {
     pub fn new() -> Self {
         Self {
+            active_view: InteractiveView::Dossier,
             search_query: String::new(),
             selected_handle: None,
             note_draft_handle: None,
             note_draft_text: String::new(),
             fetched_profiles_this_open: HashSet::new(),
             was_open: false,
+            new_poi_name: String::new(),
+            new_poi_color: OverlayColor::Cyan,
+            editing_poi_id: None,
+            editing_poi_name: String::new(),
         }
     }
 
@@ -139,18 +156,48 @@ impl InteractiveOverlayState {
 
     fn render_contents(&mut self, ui: &mut egui::Ui, shared: &Arc<AppSharedState>) {
         let p = ThemePalette::dark();
-        let hotkey_hint = shared.settings.read().hotkey_interactive_overlay.clone();
+        let (hotkey_hint, save_poi_hk) = {
+            let s = shared.settings.read();
+            (
+                s.hotkey_interactive_overlay.clone(),
+                s.hotkey_save_waypoint.clone(),
+            )
+        };
+        let wp_count = shared.waypoints.read().waypoints.len();
 
         // Top Header Bar
         ui.horizontal(|ui| {
-            ui.label(quantico_text("SC INTERACTIVE DOSSIER", 19.0, p.accent));
+            ui.label(quantico_text("SC INTERACTIVE OVERLAY", 19.0, p.accent));
+            ui.add_space(10.0);
+
+            if ui
+                .selectable_label(
+                    self.active_view == InteractiveView::Dossier,
+                    RichText::new("Citizen Dossier").strong().size(13.5),
+                )
+                .clicked()
+            {
+                self.active_view = InteractiveView::Dossier;
+            }
+            if ui
+                .selectable_label(
+                    self.active_view == InteractiveView::Waypoints,
+                    RichText::new(format!("⌖ POIs / Beacons ({})", wp_count))
+                        .strong()
+                        .size(13.5),
+                )
+                .clicked()
+            {
+                self.active_view = InteractiveView::Waypoints;
+            }
+
             ui.add_space(10.0);
             ui.label(
                 RichText::new(format!(
-                    "Press Esc or {} to return to Star Citizen • Right-click players or orgs to assign colors",
-                    hotkey_hint
+                    "Esc / {} closes • {} drops POI",
+                    hotkey_hint, save_poi_hk
                 ))
-                .size(12.5)
+                .size(12.0)
                 .color(p.muted),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -163,6 +210,11 @@ impl InteractiveOverlayState {
             });
         });
         ui.add_space(10.0);
+
+        if self.active_view == InteractiveView::Waypoints {
+            self.render_waypoints_view(ui, &p, shared);
+            return;
+        }
 
         let avail = ui.available_size();
         let left_w = (avail.x * 0.22).clamp(220.0, 320.0);
@@ -205,6 +257,238 @@ impl InteractiveOverlayState {
                 },
             );
         });
+    }
+
+    fn render_waypoints_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &ThemePalette,
+        shared: &Arc<AppSharedState>,
+    ) {
+        let live_fix = shared.last_position_fix.read().clone();
+        let store_snap = shared.waypoints.read().clone();
+        let active_id = store_snap.active_waypoint_id.clone();
+
+        egui::Frame::none()
+            .fill(p.surface.gamma_multiply(0.96))
+            .stroke(Stroke::new(1.0, p.border))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.set_min_height(ui.available_height());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(quantico_text("SAVED POIs & HUD BEACONS", 16.0, p.accent));
+                    ui.add_space(12.0);
+                    let pos_lbl = if let Some((disp, _key, c)) = &live_fix.body {
+                        format!(
+                            "● Zone Lock [{}]: {:.1}, {:.1}, {:.1} km",
+                            disp,
+                            c.x / 1000.0,
+                            c.y / 1000.0,
+                            c.z / 1000.0
+                        )
+                    } else if let Some(c) = live_fix.root {
+                        format!(
+                            "● Live Fix: {:.1}, {:.1}, {:.1} km",
+                            c.x / 1000.0,
+                            c.y / 1000.0,
+                            c.z / 1000.0
+                        )
+                    } else {
+                        "○ Waiting for r_DisplayInfo 2/3 or /showlocation".to_string()
+                    };
+                    ui.label(
+                        RichText::new(pos_lbl)
+                            .size(12.5)
+                            .color(if live_fix.has_any() { p.success } else { p.muted }),
+                    );
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    let resp = ui.add(
+                        TextEdit::singleline(&mut self.new_poi_name)
+                            .desired_width(240.0)
+                            .hint_text("New POI name (optional)…"),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    color_combo(ui, "int_new_poi_col", &mut self.new_poi_color, true);
+                    if ui.button("＋ Save Current Position").clicked() || enter {
+                        let trimmed = self.new_poi_name.trim().to_string();
+                        let opt_name = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        };
+                        let _ = shared.coordinator_tx.send(CoordinatorCommand::SaveWaypoint {
+                            name: opt_name,
+                            color: Some(self.new_poi_color),
+                        });
+                        self.new_poi_name.clear();
+                    }
+
+                    if active_id.is_some() {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("✕ Unload Active Beacon").clicked() {
+                                shared.waypoints.write().set_active(None);
+                                shared.save_waypoints();
+                            }
+                        });
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                let mut load_id: Option<Option<String>> = None;
+                let mut rename_commit: Option<(String, String)> = None;
+                let mut color_updates: Vec<(String, OverlayColor)> = Vec::new();
+                let mut removals: Vec<String> = Vec::new();
+
+                ScrollArea::vertical()
+                    .id_salt("interactive_waypoints_scroll")
+                    .show(ui, |ui| {
+                        if store_snap.waypoints.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    "No POIs saved yet. Save your current location above or press Alt+Shift+P in flight.",
+                                )
+                                .color(p.muted),
+                            );
+                        }
+                        for wp in store_snap.waypoints.iter().rev() {
+                            let is_active = active_id.as_deref() == Some(wp.id.as_str());
+                            let is_editing = self.editing_poi_id.as_deref() == Some(wp.id.as_str());
+                            let c32 = overlay_color32(wp.color);
+
+                            egui::Frame::none()
+                                .fill(p.bg.gamma_multiply(0.85))
+                                .stroke(Stroke::new(
+                                    if is_active { 1.5 } else { 1.0 },
+                                    if is_active { c32 } else { p.border },
+                                ))
+                                .rounding(Rounding::same(6.0))
+                                .inner_margin(Margin::symmetric(12.0, 8.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if is_editing {
+                                            let r = ui.add(
+                                                TextEdit::singleline(&mut self.editing_poi_name)
+                                                    .desired_width(220.0),
+                                            );
+                                            let enter = r.lost_focus()
+                                                && ui.input(|i| i.key_pressed(Key::Enter));
+                                            if ui.small_button("Save").clicked() || enter {
+                                                rename_commit = Some((
+                                                    wp.id.clone(),
+                                                    self.editing_poi_name.clone(),
+                                                ));
+                                                self.editing_poi_id = None;
+                                            }
+                                            if ui.small_button("Cancel").clicked() {
+                                                self.editing_poi_id = None;
+                                            }
+                                        } else {
+                                            ui.label(
+                                                RichText::new(format!("◆ {}", wp.name))
+                                                    .strong()
+                                                    .size(15.0)
+                                                    .color(c32),
+                                            );
+                                            if let Some((d_m, locked)) =
+                                                live_fix.distance_to_waypoint_m(wp)
+                                            {
+                                                ui.label(
+                                                    RichText::new(format_distance_m(d_m))
+                                                        .monospace()
+                                                        .strong()
+                                                        .size(13.5)
+                                                        .color(if locked { p.success } else { p.text }),
+                                                );
+                                            }
+                                            if let Some(lz) = &wp.local_zone {
+                                                ui.label(
+                                                    RichText::new(format!("[ZONE: {}]", lz))
+                                                        .size(12.0)
+                                                        .color(p.accent),
+                                                );
+                                            } else if let Some(zone) = &wp.zone {
+                                                ui.label(
+                                                    RichText::new(format!("[{}]", zone))
+                                                        .size(12.0)
+                                                        .color(p.muted),
+                                                );
+                                            }
+                                        }
+
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if ui
+                                                .small_button(RichText::new("Delete").color(p.danger))
+                                                .clicked()
+                                            {
+                                                removals.push(wp.id.clone());
+                                            }
+                                            if !is_editing && ui.small_button("Rename").clicked() {
+                                                self.editing_poi_id = Some(wp.id.clone());
+                                                self.editing_poi_name = wp.name.clone();
+                                            }
+                                            let mut col = wp.color;
+                                            if color_combo(ui, ("int_wp_col", &wp.id), &mut col, true)
+                                            {
+                                                color_updates.push((wp.id.clone(), col));
+                                            }
+                                            if is_active {
+                                                if ui
+                                                    .small_button(
+                                                        RichText::new("✓ Active").color(p.success),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    load_id = Some(None);
+                                                }
+                                            } else if ui
+                                                .small_button(
+                                                    RichText::new("🎯 Load Beacon").color(p.accent),
+                                                )
+                                                .clicked()
+                                            {
+                                                load_id = Some(Some(wp.id.clone()));
+                                            }
+                                        });
+                                    });
+                                });
+                            ui.add_space(5.0);
+                        }
+                    });
+
+                let mut dirty = false;
+                if let Some(target_opt) = load_id {
+                    shared.waypoints.write().set_active(target_opt.as_deref());
+                    dirty = true;
+                }
+                if let Some((id, new_name)) = rename_commit {
+                    if shared.waypoints.write().rename(&id, &new_name) {
+                        dirty = true;
+                    }
+                }
+                if !color_updates.is_empty() || !removals.is_empty() {
+                    let mut store = shared.waypoints.write();
+                    for (id, c) in color_updates {
+                        if store.set_color(&id, c) {
+                            dirty = true;
+                        }
+                    }
+                    for id in removals {
+                        if store.remove(&id) {
+                            dirty = true;
+                        }
+                    }
+                }
+                if dirty {
+                    shared.save_waypoints();
+                }
+            });
     }
 
     fn render_search_column(

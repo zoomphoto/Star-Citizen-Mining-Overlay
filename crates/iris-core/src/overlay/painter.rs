@@ -2,7 +2,7 @@ use crate::config::settings::AppSettings;
 use crate::mining::reader::MiningSettings;
 use crate::models::{
     BreadcrumbOverlayInfo, DebugBoxKind, DebugOverlayInfo, MiningLabelItem, OverlayModel,
-    PixelRect, ProximityZone,
+    PixelRect, ProximityZone, WaypointOverlayInfo,
 };
 use crate::overlay::metrics::{BracketMetrics, BracketRasterizer};
 use crate::overlay::panel::{PanelLayout, PanelLayoutResult};
@@ -38,6 +38,38 @@ struct DebugHudLayout {
     pad_y: f64,
     dot_space: f64,
     pips_reserve: f64,
+}
+
+struct WaypointHudLayout {
+    card_rect: PixelRect,
+    dial_cx: f64,
+    dial_cy: f64,
+    dial_r: f64,
+    text_x: f64,
+    text_w: f64,
+    scale: f64,
+    title_px: f32,
+    dist_px: f32,
+    sub_px: f32,
+    pad_y: f64,
+    top_row_h: f64,
+    sub_row_h: f64,
+    ring_marker: Option<WaypointRingMarkerLayout>,
+}
+
+struct WaypointRingMarkerLayout {
+    icon_x: f64,
+    icon_y: f64,
+    dir_x: f64,
+    dir_y: f64,
+    pill_rect: PixelRect,
+    name_px: f32,
+    dist_px: f32,
+    line_h: f64,
+    pad_x: f64,
+    pad_y: f64,
+    short_name: String,
+    dist_line: String,
 }
 
 const QUANTICO_BOLD_TTF: &[u8] = include_bytes!("../../../../assets/Quantico-Bold.ttf");
@@ -190,12 +222,7 @@ impl SoftwareOverlayPainter {
 
         let debug_layout = model.debug_info.as_ref().map(|dbg| {
             let layout = Self::compute_debug_layout(dbg, screen_w, screen_h);
-            Self::draw_debug_vectors(
-                pixmap,
-                dbg,
-                &layout,
-                model.boundary_rect.is_some(),
-            );
+            Self::draw_debug_vectors(pixmap, dbg, &layout, model.boundary_rect.is_some());
             layout
         });
 
@@ -203,6 +230,42 @@ impl SoftwareOverlayPainter {
             let layout = Self::compute_breadcrumb_layout(bc, screen_w, screen_h);
             Self::draw_breadcrumb_vectors(pixmap, bc, &layout, screen_w, screen_h);
             layout
+        });
+
+        let top_banner_bottom = breadcrumb_layout
+            .as_ref()
+            .and_then(|b| b.banner_rect)
+            .map(|r| r.bottom());
+        let waypoint_layout = model.waypoint_info.as_ref().map(|wp| {
+            let layout = Self::compute_waypoint_layout(wp, screen_w, screen_h, top_banner_bottom);
+            Self::draw_waypoint_vectors(pixmap, wp, &layout);
+            layout
+        });
+
+        let center_toast_layout = model.center_toast.as_deref().map(|msg| {
+            let scale = (screen_h / BracketMetrics::REFERENCE_SCREEN_HEIGHT).clamp(0.75, 2.25);
+            let font_px = (14.5 * scale) as f32;
+            let (tw, _) = Self::measure_text(msg, font_px);
+            let pad_x = 16.0 * scale;
+            let pad_y = 7.0 * scale;
+            let bw = ((tw as f64) + 2.0 * pad_x).clamp(240.0 * scale, screen_w * 0.65);
+            let bh = (font_px as f64) * 1.35 + 2.0 * pad_y;
+            let anchor_y = waypoint_layout
+                .as_ref()
+                .map(|wl| wl.card_rect.bottom() + 10.0 * scale)
+                .or_else(|| top_banner_bottom.map(|b| b + 10.0 * scale))
+                .unwrap_or_else(|| (84.0 * scale).max(screen_h * 0.075));
+            let rect = PixelRect::new(((screen_w - bw) * 0.5).round(), anchor_y.round(), bw.ceil(), bh.ceil());
+            let rad = 7.0 * scale;
+            Self::draw_rounded_box(pixmap, rect, rad, Color::from_rgba8(0x0B, 0x10, 0x18, 0xE6));
+            Self::stroke_rounded_box(
+                pixmap,
+                rect,
+                rad,
+                Color::from_rgba8(0x00, 0xE5, 0xFF, 0xEC),
+                (1.5 * scale).max(1.0) as f32,
+            );
+            (rect, font_px, pad_x, pad_y)
         });
 
         // Copy tiny-skia's premultiplied RGBA8 buffer into reusable BGRA8 buffer,
@@ -219,16 +282,8 @@ impl SoftwareOverlayPainter {
 
         // 2. Brackets (`{ }`, `[ ]`, `< >`) rasterized directly into premultiplied BGRA8
         if !model.brackets.is_empty() {
-            self.brackets.draw(
-                bgra,
-                w * 4,
-                w,
-                h,
-                &model.brackets,
-                0.0,
-                0.0,
-                screen_h,
-            );
+            self.brackets
+                .draw(bgra, w * 4, w, h, &model.brackets, 0.0, 0.0, screen_h);
         }
 
         // 3. Crisp outlined Quantico-Bold typography into premultiplied BGRA8
@@ -286,6 +341,28 @@ impl SoftwareOverlayPainter {
             Self::draw_breadcrumb_text(bgra, w, h, bc, layout);
         }
 
+        if let (Some(wp), Some(layout)) = (model.waypoint_info.as_ref(), waypoint_layout.as_ref()) {
+            Self::draw_waypoint_text(bgra, w, h, wp, layout);
+        }
+
+        if let (Some(msg), Some((rect, font_px, pad_x, pad_y))) =
+            (model.center_toast.as_deref(), center_toast_layout)
+        {
+            Self::draw_outlined_text_rgb(
+                bgra,
+                w,
+                h,
+                msg,
+                rect.x + pad_x,
+                rect.y + pad_y,
+                (rect.width - 2.0 * pad_x).max(40.0),
+                (rect.height - 2.0 * pad_y).max(16.0),
+                font_px,
+                true,
+                (0x00, 0xE5, 0xFF),
+            );
+        }
+
         &self.bgra_buf[..total_bytes]
     }
 
@@ -312,7 +389,13 @@ impl SoftwareOverlayPainter {
             ..Stroke::default()
         };
         dark_stroke.line_join = tiny_skia::LineJoin::Round;
-        pixmap.stroke_path(&path, &dark_paint, &dark_stroke, Transform::identity(), None);
+        pixmap.stroke_path(
+            &path,
+            &dark_paint,
+            &dark_stroke,
+            Transform::identity(),
+            None,
+        );
 
         let mut yellow_paint = Paint::default();
         yellow_paint.set_color_rgba8(0xFF, 0xD5, 0x00, 0xFF);
@@ -477,10 +560,7 @@ impl SoftwareOverlayPainter {
         }
     }
 
-    fn compute_mining_layout(
-        label: &MiningLabelItem,
-        scale: f64,
-    ) -> (PixelRect, f32, f64, f64) {
+    fn compute_mining_layout(label: &MiningLabelItem, scale: f64) -> (PixelRect, f32, f64, f64) {
         let settings = MiningSettings::default();
         let h = (label.digit_height * scale).max(6.0);
         let font_px = (h / Self::CAP_HEIGHT_EM) as f32;
@@ -633,8 +713,8 @@ impl SoftwareOverlayPainter {
         let card_w = (max_content_w.max(min_w) + 2.0 * pad_x)
             .min((screen_w * 0.65).max(160.0))
             .ceil();
-        let card_h = (pad_y * 2.0 + header_h + (dbg.lines.len() as f64) * line_h + 4.0 * scale)
-            .ceil();
+        let card_h =
+            (pad_y * 2.0 + header_h + (dbg.lines.len() as f64) * line_h + 4.0 * scale).ceil();
         let card_x = (screen_w * 0.015).round();
         let card_y = (screen_h * 0.02).round();
 
@@ -652,21 +732,13 @@ impl SoftwareOverlayPainter {
         }
     }
 
-    fn draw_stroked_rect(
-        pixmap: &mut Pixmap,
-        r: PixelRect,
-        stroke_w: f32,
-        rgba: (u8, u8, u8, u8),
-    ) {
+    fn draw_stroked_rect(pixmap: &mut Pixmap, r: PixelRect, stroke_w: f32, rgba: (u8, u8, u8, u8)) {
         if r.width <= 1.0 || r.height <= 1.0 {
             return;
         }
-        let Some(rect) = tiny_skia::Rect::from_xywh(
-            r.x as f32,
-            r.y as f32,
-            r.width as f32,
-            r.height as f32,
-        ) else {
+        let Some(rect) =
+            tiny_skia::Rect::from_xywh(r.x as f32, r.y as f32, r.width as f32, r.height as f32)
+        else {
             return;
         };
         let path = PathBuilder::from_rect(rect);
@@ -730,7 +802,8 @@ impl SoftwareOverlayPainter {
         );
 
         // Subtle divider line below headline
-        let div_y = (layout.card_rect.y + layout.pad_y + layout.header_h + 1.5 * layout.scale) as f32;
+        let div_y =
+            (layout.card_rect.y + layout.pad_y + layout.header_h + 1.5 * layout.scale) as f32;
         if let Some(div_rect) = tiny_skia::Rect::from_xywh(
             (layout.card_rect.x + layout.pad_x) as f32,
             div_y,
@@ -797,11 +870,9 @@ impl SoftwareOverlayPainter {
         layout: &DebugHudLayout,
     ) {
         let (sr, sg, sb) = dbg.level.rgb();
-        let head_max_w = (layout.card_rect.width
-            - 2.0 * layout.pad_x
-            - layout.dot_space
-            - layout.pips_reserve)
-            .max(20.0);
+        let head_max_w =
+            (layout.card_rect.width - 2.0 * layout.pad_x - layout.dot_space - layout.pips_reserve)
+                .max(20.0);
         Self::draw_outlined_text_rgb(
             bgra,
             w,
@@ -817,8 +888,7 @@ impl SoftwareOverlayPainter {
         );
 
         let body_max_w = (layout.card_rect.width - 2.0 * layout.pad_x).max(20.0);
-        let body_top0 =
-            layout.card_rect.y + layout.pad_y + layout.header_h + 3.5 * layout.scale;
+        let body_top0 = layout.card_rect.y + layout.pad_y + layout.header_h + 3.5 * layout.scale;
         for (i, line) in dbg.lines.iter().enumerate() {
             Self::draw_outlined_text_rgb(
                 bgra,
@@ -853,7 +923,8 @@ impl SoftwareOverlayPainter {
         let card_w = (264.0 * scale).min((screen_w * 0.28).max(180.0));
         let radar_w = (card_w - 2.0 * pad_x).max(120.0);
         let radar_h = (166.0 * scale).min((screen_h * 0.24).max(110.0));
-        let card_h = pad_y * 2.0 + header_h + 6.0 * scale + radar_h + 6.0 * scale + footer_line_h * 2.0;
+        let card_h =
+            pad_y * 2.0 + header_h + 6.0 * scale + radar_h + 6.0 * scale + footer_line_h * 2.0;
 
         let margin_x = (18.0 * scale).min(screen_w * 0.04);
         let margin_y = (22.0 * scale).min(screen_h * 0.05);
@@ -935,13 +1006,24 @@ impl SoftwareOverlayPainter {
                     paint.shader = shader;
                     paint.anti_alias = true;
                     let path = PathBuilder::from_rect(rect);
-                    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                    pixmap.fill_path(
+                        &path,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
                 }
             }
 
             if let Some(banner) = layout.banner_rect {
                 let rad = 7.0 * layout.scale;
-                Self::draw_rounded_box(pixmap, banner, rad, Color::from_rgba8(0x10, 0x12, 0x18, 0xCC));
+                Self::draw_rounded_box(
+                    pixmap,
+                    banner,
+                    rad,
+                    Color::from_rgba8(0x10, 0x12, 0x18, 0xCC),
+                );
                 Self::stroke_rounded_box(
                     pixmap,
                     banner,
@@ -995,13 +1077,19 @@ impl SoftwareOverlayPainter {
         let cx = r_rect.x + half_w;
         let cy = r_rect.y + half_h;
         let px_per_km = half_w.min(half_h) / max_extent_km;
-        let cloud_radius_px = ((bc.visited_radius_km * px_per_km) as f32).max(10.0 * layout.scale as f32);
+        let cloud_radius_px =
+            ((bc.visited_radius_km * px_per_km) as f32).max(10.0 * layout.scale as f32);
 
         // Build a lightweight clip mask for the inner radar viewport so corridor clouds never bleed
         // outside the radar border.
         let mut radar_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height());
         if let Some(mask) = radar_mask.as_mut() {
-            mask.fill_path(&radar_clip_path, FillRule::Winding, true, Transform::identity());
+            mask.fill_path(
+                &radar_clip_path,
+                FillRule::Winding,
+                true,
+                Transform::identity(),
+            );
         }
 
         // 3. Draw glowing color cloud corridor along the entire flight path between points
@@ -1037,7 +1125,8 @@ impl SoftwareOverlayPainter {
                     let mut outer_p = Paint::default();
                     outer_p.set_color_rgba8(cr, cg, cb, 40);
                     outer_p.anti_alias = true;
-                    let outer_w = (cloud_radius_px * 1.45).clamp(10.0, (r_rect.height as f32) * 0.45);
+                    let outer_w =
+                        (cloud_radius_px * 1.45).clamp(10.0, (r_rect.height as f32) * 0.45);
                     let outer_stroke = Stroke {
                         width: outer_w,
                         line_cap: tiny_skia::LineCap::Round,
@@ -1218,6 +1307,74 @@ impl SoftwareOverlayPainter {
             }
         }
 
+        // Active waypoint beacon diamond + guide line on 2D radar
+        if let Some(pin) = &bc.active_waypoint {
+            let (pr, pg, pb) = pin.color.rgb();
+            let raw_x = cx + pin.dx_km * px_per_km;
+            let raw_y = cy - pin.dy_km * px_per_km;
+            let inset = 8.0 * layout.scale;
+            let min_x = r_rect.x + inset;
+            let max_x = r_rect.right() - inset;
+            let min_y = r_rect.y + inset;
+            let max_y = r_rect.bottom() - inset;
+
+            // Clamp vector onto radar viewport border if waypoint is beyond local zoom
+            let mut px = raw_x;
+            let mut py = raw_y;
+            if px < min_x || px > max_x || py < min_y || py > max_y {
+                let vx = raw_x - cx;
+                let vy = raw_y - cy;
+                let mut t = 1.0f64;
+                if vx > 0.0 {
+                    t = t.min((max_x - cx) / vx);
+                } else if vx < 0.0 {
+                    t = t.min((min_x - cx) / vx);
+                }
+                if vy > 0.0 {
+                    t = t.min((max_y - cy) / vy);
+                } else if vy < 0.0 {
+                    t = t.min((min_y - cy) / vy);
+                }
+                t = t.clamp(0.0, 1.0);
+                px = cx + vx * t;
+                py = cy + vy * t;
+            }
+
+            let mut guide_pb = PathBuilder::new();
+            guide_pb.move_to(cx as f32, cy as f32);
+            guide_pb.line_to(px as f32, py as f32);
+            if let Some(gpath) = guide_pb.finish() {
+                let mut gp = Paint::default();
+                gp.set_color_rgba8(pr, pg, pb, 0x99);
+                gp.anti_alias = true;
+                let gstroke = Stroke {
+                    width: (1.4 * layout.scale).max(1.0) as f32,
+                    ..Stroke::default()
+                };
+                pixmap.stroke_path(
+                    &gpath,
+                    &gp,
+                    &gstroke,
+                    Transform::identity(),
+                    radar_mask.as_ref(),
+                );
+            }
+
+            let dr = (5.2 * layout.scale).max(4.0) as f32;
+            let mut dpb = PathBuilder::new();
+            dpb.move_to(px as f32, py as f32 - dr);
+            dpb.line_to(px as f32 + dr, py as f32);
+            dpb.line_to(px as f32, py as f32 + dr);
+            dpb.line_to(px as f32 - dr, py as f32);
+            dpb.close();
+            if let Some(dpath) = dpb.finish() {
+                let mut dp = Paint::default();
+                dp.set_color_rgba8(pr, pg, pb, 0xFF);
+                dp.anti_alias = true;
+                pixmap.fill_path(&dpath, &dp, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+
         // Current ship marker at radar center
         let ship_r = (4.8 * layout.scale).max(3.5) as f32;
         if let Some(heading) = bc.heading_rad {
@@ -1335,6 +1492,498 @@ impl SoftwareOverlayPainter {
         );
     }
 
+    fn compute_waypoint_layout(
+        wp: &WaypointOverlayInfo,
+        screen_w: f64,
+        screen_h: f64,
+        top_banner_bottom: Option<f64>,
+    ) -> WaypointHudLayout {
+        let scale = (screen_h / BracketMetrics::REFERENCE_SCREEN_HEIGHT).clamp(0.75, 2.25);
+        let pad_x = 12.0 * scale;
+        let pad_y = 8.0 * scale;
+        let dial_r = 22.0 * scale;
+        let dial_gap = 12.0 * scale;
+        let title_px = (15.0 * scale) as f32;
+        let dist_px = (18.0 * scale) as f32;
+        let sub_px = (11.5 * scale) as f32;
+        let top_row_h = (dist_px as f64) * 1.25;
+        let sub_row_h = (sub_px as f64) * 1.32;
+
+        let (name_w, _) = Self::measure_text(&wp.name, title_px);
+        let (dist_w, _) = Self::measure_text(&wp.distance_text, dist_px);
+        let (sub_w, _) = Self::measure_text(&wp.subline, sub_px);
+
+        let top_w = name_w as f64 + 18.0 * scale + dist_w as f64;
+        let text_w = top_w
+            .max(sub_w as f64)
+            .clamp(210.0 * scale, (screen_w * 0.44).max(220.0));
+        let card_w = (pad_x * 2.0 + dial_r * 2.0 + dial_gap + text_w)
+            .min((screen_w * 0.56).max(280.0))
+            .ceil();
+        let content_h = (top_row_h + sub_row_h + 2.0 * scale).max(dial_r * 2.0);
+        let card_h = (pad_y * 2.0 + content_h).ceil();
+
+        let card_x = ((screen_w - card_w) * 0.5).round();
+        // Sit cleanly below Star Citizen's top-center helmet/ship compass bar (~7.5% from top)
+        let default_y = (84.0 * scale).max(screen_h * 0.075);
+        let card_y = match top_banner_bottom {
+            Some(b) => (b + 10.0 * scale).max(default_y),
+            None => default_y,
+        }
+        .round();
+
+        let card_rect = PixelRect::new(card_x, card_y, card_w, card_h);
+        let dial_cx = card_rect.x + pad_x + dial_r;
+        let dial_cy = card_rect.y + card_rect.height * 0.5;
+        let text_x = card_rect.x + pad_x + dial_r * 2.0 + dial_gap;
+        let actual_text_w = (card_rect.right() - pad_x - text_x).max(60.0);
+
+        let ring_marker = if wp.show_ring_marker {
+            wp.rel_yaw_rad.map(|rel_yaw| {
+                // rel_yaw: 0 = ahead (UP), <0 = RIGHT, >0 = LEFT, +/-pi = behind (DOWN)
+                let screen_angle = -rel_yaw;
+                let dir_x = screen_angle.sin();
+                let dir_y = -screen_angle.cos();
+
+                let cx = screen_w * 0.5;
+                let cy = screen_h * 0.5;
+                let rx = (screen_w * 0.29).min(screen_h * 0.46);
+                let ry = screen_h * 0.30;
+
+                let mut icon_x = cx + dir_x * rx;
+                let mut icon_y = cy + dir_y * ry;
+
+                // Keep well clear of the top-center guidance card when aiming straight up
+                let min_top_y = card_rect.bottom() + 34.0 * scale;
+                if icon_y < min_top_y {
+                    icon_y = min_top_y;
+                }
+                let margin_x = 95.0 * scale;
+                let margin_bot = 68.0 * scale;
+                icon_x = icon_x.clamp(margin_x, (screen_w - margin_x).max(margin_x));
+                icon_y = icon_y.clamp(min_top_y, (screen_h - margin_bot).max(min_top_y));
+
+                let short_name = if wp.name.chars().count() > 20 {
+                    let cut: String = wp.name.chars().take(18).collect();
+                    format!("{}..", cut)
+                } else {
+                    wp.name.clone()
+                };
+
+                let dist_line = if wp.dz_m.abs() >= 100.0 {
+                    let sign = if wp.dz_m > 0.0 { "+" } else { "-" };
+                    let dz_txt = crate::waypoints::format_distance_m(wp.dz_m.abs());
+                    format!("{}  ({}{}Z)", wp.distance_text, sign, dz_txt)
+                } else {
+                    wp.distance_text.clone()
+                };
+
+                let r_name_px = (12.0 * scale) as f32;
+                let r_dist_px = (13.5 * scale) as f32;
+                let r_line_h = (r_dist_px as f64) * 1.24;
+                let r_pad_x = 8.0 * scale;
+                let r_pad_y = 4.0 * scale;
+                let (nw, _) = Self::measure_text(&short_name, r_name_px);
+                let (dw, _) = Self::measure_text(&dist_line, r_dist_px);
+                let pill_w = ((nw.max(dw) as f64) + 2.0 * r_pad_x)
+                    .clamp(92.0 * scale, 220.0 * scale)
+                    .ceil();
+                let pill_h = (r_pad_y * 2.0 + r_line_h * 2.0).ceil();
+
+                // Place label pill slightly inward from the directional chevron so it never clips screen edges
+                let offset_dist = 22.0 * scale;
+                let mut pill_cx = icon_x - dir_x * (offset_dist + pill_w * 0.45);
+                let pill_cy = icon_y - dir_y * (offset_dist + pill_h * 0.55);
+                if dir_y.abs() > 0.75 {
+                    pill_cx = icon_x;
+                }
+                let pill_x = (pill_cx - pill_w * 0.5).clamp(
+                    12.0 * scale,
+                    (screen_w - pill_w - 12.0 * scale).max(12.0 * scale),
+                );
+                let pill_y = (pill_cy - pill_h * 0.5).clamp(
+                    card_rect.bottom() + 8.0 * scale,
+                    (screen_h - pill_h - 12.0 * scale).max(card_rect.bottom() + 8.0 * scale),
+                );
+
+                WaypointRingMarkerLayout {
+                    icon_x,
+                    icon_y,
+                    dir_x,
+                    dir_y,
+                    pill_rect: PixelRect::new(pill_x, pill_y, pill_w, pill_h),
+                    name_px: r_name_px,
+                    dist_px: r_dist_px,
+                    line_h: r_line_h,
+                    pad_x: r_pad_x,
+                    pad_y: r_pad_y,
+                    short_name,
+                    dist_line,
+                }
+            })
+        } else {
+            None
+        };
+
+        WaypointHudLayout {
+            card_rect,
+            dial_cx,
+            dial_cy,
+            dial_r,
+            text_x,
+            text_w: actual_text_w,
+            scale,
+            title_px,
+            dist_px,
+            sub_px,
+            pad_y,
+            top_row_h,
+            sub_row_h,
+            ring_marker,
+        }
+    }
+
+    fn draw_waypoint_vectors(
+        pixmap: &mut Pixmap,
+        wp: &WaypointOverlayInfo,
+        layout: &WaypointHudLayout,
+    ) {
+        let (cr, cg, cb) = if wp.arrived {
+            (0x2E, 0xE6, 0x5A)
+        } else {
+            wp.color.rgb()
+        };
+        let s = layout.scale as f32;
+
+        // 1. Top-center Waypoint Beacon Guidance Card
+        let card_rad = 8.0 * layout.scale;
+        Self::draw_rounded_box(
+            pixmap,
+            layout.card_rect,
+            card_rad,
+            Color::from_rgba8(0x0B, 0x10, 0x18, 0xDC),
+        );
+        Self::stroke_rounded_box(
+            pixmap,
+            layout.card_rect,
+            card_rad,
+            Color::from_rgba8(cr, cg, cb, 0xD8),
+            (1.5 * s).max(1.0),
+        );
+
+        // 2. Rotating 360° Directional Compass Dial on card left
+        let dcx = layout.dial_cx as f32;
+        let dcy = layout.dial_cy as f32;
+        let dr = layout.dial_r as f32;
+
+        if let Some(bg_circle) = PathBuilder::from_circle(dcx, dcy, dr) {
+            let mut bgp = Paint::default();
+            bgp.set_color_rgba8(0x06, 0x09, 0x0F, 0xEB);
+            bgp.anti_alias = true;
+            pixmap.fill_path(
+                &bg_circle,
+                &bgp,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+
+            let mut ring_p = Paint::default();
+            ring_p.set_color_rgba8(cr, cg, cb, 0xA8);
+            ring_p.anti_alias = true;
+            let ring_stroke = Stroke {
+                width: (1.5 * s).max(1.0),
+                ..Stroke::default()
+            };
+            pixmap.stroke_path(
+                &bg_circle,
+                &ring_p,
+                &ring_stroke,
+                Transform::identity(),
+                None,
+            );
+        }
+
+        // Subtle cardinal tick marks (Forward / Right / Aft / Left relative to ship nose)
+        let mut tick_paint = Paint::default();
+        tick_paint.set_color_rgba8(0x90, 0xA8, 0xC4, 0x70);
+        tick_paint.anti_alias = true;
+        let tick_stroke = Stroke {
+            width: (1.1 * s).max(1.0),
+            ..Stroke::default()
+        };
+        for &(tx, ty) in &[(0.0f32, -1.0f32), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)] {
+            let mut pb = PathBuilder::new();
+            pb.move_to(dcx + tx * (dr - 3.5 * s), dcy + ty * (dr - 3.5 * s));
+            pb.line_to(dcx + tx * (dr - 0.5 * s), dcy + ty * (dr - 0.5 * s));
+            if let Some(tp) = pb.finish() {
+                pixmap.stroke_path(&tp, &tick_paint, &tick_stroke, Transform::identity(), None);
+            }
+        }
+
+        if let Some(rel_yaw) = wp.rel_yaw_rad {
+            let screen_angle = -rel_yaw;
+            let dx = screen_angle.sin() as f32;
+            let dy = -screen_angle.cos() as f32;
+            let px = -dy; // perpendicular right
+            let py = dx;
+
+            // Bold directional pointer arrow inside dial
+            let tip_x = dcx + dx * (dr * 0.78);
+            let tip_y = dcy + dy * (dr * 0.78);
+            let tail_x = dcx - dx * (dr * 0.16);
+            let tail_y = dcy - dy * (dr * 0.16);
+            let wing_back = dr * 0.48;
+            let wing_side = dr * 0.44;
+            let lw_x = dcx - dx * wing_back - px * wing_side;
+            let lw_y = dcy - dy * wing_back - py * wing_side;
+            let rw_x = dcx - dx * wing_back + px * wing_side;
+            let rw_y = dcy - dy * wing_back + py * wing_side;
+
+            let mut pb = PathBuilder::new();
+            pb.move_to(tip_x, tip_y);
+            pb.line_to(rw_x, rw_y);
+            pb.line_to(tail_x, tail_y);
+            pb.line_to(lw_x, lw_y);
+            pb.close();
+            if let Some(arrow) = pb.finish() {
+                let mut ap = Paint::default();
+                ap.set_color_rgba8(cr, cg, cb, 0xFF);
+                ap.anti_alias = true;
+                pixmap.fill_path(&arrow, &ap, FillRule::Winding, Transform::identity(), None);
+            }
+
+            // Bright pip on dial rim indicating direction
+            let rim_x = dcx + dx * dr;
+            let rim_y = dcy + dy * dr;
+            if let Some(pip) = PathBuilder::from_circle(rim_x, rim_y, (2.6 * s).max(2.0)) {
+                let mut pp = Paint::default();
+                pp.set_color_rgba8(0xFF, 0xFF, 0xFF, 0xFF);
+                pp.anti_alias = true;
+                pixmap.fill_path(&pip, &pp, FillRule::Winding, Transform::identity(), None);
+            }
+        } else {
+            // Arrived or waiting for movement lock: crisp glowing waypoint diamond
+            let d = dr * 0.46;
+            let mut pb = PathBuilder::new();
+            pb.move_to(dcx, dcy - d);
+            pb.line_to(dcx + d, dcy);
+            pb.line_to(dcx, dcy + d);
+            pb.line_to(dcx - d, dcy);
+            pb.close();
+            if let Some(diamond) = pb.finish() {
+                let mut dp = Paint::default();
+                dp.set_color_rgba8(cr, cg, cb, if wp.arrived { 0xFF } else { 0xC8 });
+                dp.anti_alias = true;
+                pixmap.fill_path(
+                    &diamond,
+                    &dp,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+
+        // 3. Floating HUD Directional Ring Marker ("9.9 km THIS WAY")
+        if let Some(rm) = &layout.ring_marker {
+            let ix = rm.icon_x as f32;
+            let iy = rm.icon_y as f32;
+            let dx = rm.dir_x as f32;
+            let dy = rm.dir_y as f32;
+            let px = -dy;
+            let py = dx;
+
+            // Soft radial glow behind the floating beacon chevron
+            let glow_r = 22.0 * s;
+            let glow_center = Point::from_xy(ix, iy);
+            let stops = vec![
+                GradientStop::new(0.0, Color::from_rgba8(cr, cg, cb, 0x70)),
+                GradientStop::new(1.0, Color::from_rgba8(cr, cg, cb, 0x00)),
+            ];
+            if let Some(shader) = RadialGradient::new(
+                glow_center,
+                glow_center,
+                glow_r,
+                stops,
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) {
+                if let Some(glow_circle) = PathBuilder::from_circle(ix, iy, glow_r) {
+                    let mut gp = Paint::default();
+                    gp.shader = shader;
+                    gp.anti_alias = true;
+                    pixmap.fill_path(
+                        &glow_circle,
+                        &gp,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
+
+            // Directional chevron arrow pointing outward toward POI
+            let tip_x = ix + dx * (15.0 * s);
+            let tip_y = iy + dy * (15.0 * s);
+            let notch_x = ix - dx * (2.5 * s);
+            let notch_y = iy - dy * (2.5 * s);
+            let wing_b = 9.0 * s;
+            let wing_s = 10.5 * s;
+            let lw_x = ix - dx * wing_b - px * wing_s;
+            let lw_y = iy - dy * wing_b - py * wing_s;
+            let rw_x = ix - dx * wing_b + px * wing_s;
+            let rw_y = iy - dy * wing_b + py * wing_s;
+
+            let mut pb = PathBuilder::new();
+            pb.move_to(tip_x, tip_y);
+            pb.line_to(rw_x, rw_y);
+            pb.line_to(notch_x, notch_y);
+            pb.line_to(lw_x, lw_y);
+            pb.close();
+            if let Some(chev) = pb.finish() {
+                // Dark outline for contrast against bright skies/planets
+                let mut out_p = Paint::default();
+                out_p.set_color_rgba8(0x0A, 0x0A, 0x0F, 0xE6);
+                out_p.anti_alias = true;
+                let out_s = Stroke {
+                    width: (3.2 * s).max(2.0),
+                    line_join: tiny_skia::LineJoin::Round,
+                    ..Stroke::default()
+                };
+                pixmap.stroke_path(&chev, &out_p, &out_s, Transform::identity(), None);
+
+                let mut fill_p = Paint::default();
+                fill_p.set_color_rgba8(cr, cg, cb, 0xFF);
+                fill_p.anti_alias = true;
+                pixmap.fill_path(
+                    &chev,
+                    &fill_p,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+
+            // Compact label pill carrying POI name & live distance
+            let pill_rad = 6.0 * layout.scale;
+            Self::draw_rounded_box(
+                pixmap,
+                rm.pill_rect,
+                pill_rad,
+                Color::from_rgba8(0x0B, 0x10, 0x18, 0xD4),
+            );
+            Self::stroke_rounded_box(
+                pixmap,
+                rm.pill_rect,
+                pill_rad,
+                Color::from_rgba8(cr, cg, cb, 0xC8),
+                (1.2 * s).max(1.0),
+            );
+        }
+    }
+
+    fn draw_waypoint_text(
+        bgra: &mut [u8],
+        w: usize,
+        h: usize,
+        wp: &WaypointOverlayInfo,
+        layout: &WaypointHudLayout,
+    ) {
+        let (cr, cg, cb) = if wp.arrived {
+            (0x2E, 0xE6, 0x5A)
+        } else {
+            wp.color.rgb()
+        };
+
+        let top_y = layout.card_rect.y + layout.pad_y;
+        let (dist_w, _) = Self::measure_text(&wp.distance_text, layout.dist_px);
+        let dist_box_w = (dist_w as f64 + 6.0 * layout.scale).min(layout.text_w * 0.48);
+        let name_max_w = (layout.text_w - dist_box_w - 10.0 * layout.scale).max(40.0);
+
+        // POI Name (left of top row)
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            &wp.name,
+            layout.text_x,
+            top_y,
+            name_max_w,
+            layout.top_row_h,
+            layout.title_px,
+            false,
+            (cr, cg, cb),
+        );
+
+        // Live Distance Readout (right-aligned in top row)
+        let dist_x = layout.text_x + layout.text_w - dist_box_w;
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            &wp.distance_text,
+            dist_x,
+            top_y,
+            dist_box_w,
+            layout.top_row_h,
+            layout.dist_px,
+            true,
+            if wp.arrived {
+                (0x2E, 0xE6, 0x5A)
+            } else {
+                (255, 255, 255)
+            },
+        );
+
+        // Steering / Vertical / ETA Subline
+        let sub_y = top_y + layout.top_row_h + 1.0 * layout.scale;
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            &wp.subline,
+            layout.text_x,
+            sub_y,
+            layout.text_w,
+            layout.sub_row_h,
+            layout.sub_px,
+            false,
+            (206, 222, 238),
+        );
+
+        // Floating HUD Directional Ring Marker text
+        if let Some(rm) = &layout.ring_marker {
+            let inner_w = (rm.pill_rect.width - 2.0 * rm.pad_x).max(24.0);
+            Self::draw_outlined_text_rgb(
+                bgra,
+                w,
+                h,
+                &rm.short_name,
+                rm.pill_rect.x + rm.pad_x,
+                rm.pill_rect.y + rm.pad_y,
+                inner_w,
+                rm.line_h,
+                rm.name_px,
+                true,
+                (cr, cg, cb),
+            );
+            Self::draw_outlined_text_rgb(
+                bgra,
+                w,
+                h,
+                &rm.dist_line,
+                rm.pill_rect.x + rm.pad_x,
+                rm.pill_rect.y + rm.pad_y + rm.line_h,
+                inner_w,
+                rm.line_h,
+                rm.dist_px,
+                true,
+                (255, 255, 255),
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_colored_text(
         bgra: &mut [u8],
@@ -1387,10 +2036,12 @@ impl SoftwareOverlayPainter {
                     let inv = 1.0 - a;
                     let idx = (py as usize * w + px as usize) * 4;
                     bgra[idx] = (cb * a + bgra[idx] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-                    bgra[idx + 1] =
-                        (cg * a + bgra[idx + 1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-                    bgra[idx + 2] =
-                        (cr * a + bgra[idx + 2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+                    bgra[idx + 1] = (cg * a + bgra[idx + 1] as f32 * inv)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    bgra[idx + 2] = (cr * a + bgra[idx + 2] as f32 * inv)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                     bgra[idx + 3] = (255.0 * a + bgra[idx + 3] as f32 * inv)
                         .round()
                         .clamp(0.0, 255.0) as u8;

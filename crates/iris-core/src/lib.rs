@@ -6,6 +6,7 @@ pub mod mining;
 pub mod models;
 pub mod overlay;
 pub mod pipeline;
+pub mod waypoints;
 
 #[cfg(test)]
 mod tests {
@@ -555,5 +556,207 @@ mod tests {
         }
         let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         println!("1080p warm find_candidates avg: {:.2} ms/frame", avg_ms);
+    }
+
+    #[test]
+    fn waypoints_storage_guidance_and_hud_render() {
+        use crate::breadcrumbs::SpaceCoord;
+        use crate::waypoints::{format_distance_m, HeadingTracker, WaypointGuidance, WaypointStore};
+
+        // 1. Hotkey & settings roundtrip for Alt+Shift+P
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.hotkey_save_waypoint, "Alt+Shift+P");
+        assert!(settings.waypoints_enabled);
+        assert!(settings.waypoints_show_ring_marker);
+        let chord = HotkeyText::parse(&settings.hotkey_save_waypoint).expect("Alt+Shift+P valid");
+        assert!(chord.alt && chord.shift && !chord.ctrl && chord.key == "P");
+        settings.waypoints_show_ring_marker = false;
+        let round = AppSettingsToml::read(&AppSettingsToml::write(&settings));
+        assert!(round.is_valid());
+        assert_eq!(round.settings.hotkey_save_waypoint, "Alt+Shift+P");
+        assert!(!round.settings.waypoints_show_ring_marker);
+
+        // 2. Zone parsing from r_DisplayInfo
+        let di = "\
+            CamDir: -47 22 -129 HOF: 11\n\
+            Zone: rs_refinery_pyro Pos: -17.75m 5.55m -17.46m\n\
+            Zone: solarsystem_4254651523815 Pos: -16111907.1877km 45541999.9767km -90.6115km\n\
+            Zone: Root Pos: -16111907.1877km 45541999.9767km -90.6115km";
+        assert_eq!(
+            SpaceCoord::parse_display_info_zone(di).as_deref(),
+            Some("rs_refinery_pyro")
+        );
+
+        // 3. WaypointStore CRUD + JSON import/export
+        let t0 = Utc::now();
+        let mut store = WaypointStore::default();
+        let target_coord = SpaceCoord::new(0.0, 10_000.0, 500.0);
+        let wp = store.add_point(
+            target_coord,
+            None,
+            Some("solarsystem_test".to_string()),
+            Some("Rich Quantainium".to_string()),
+            Some(OverlayColor::Yellow),
+            t0,
+        );
+        assert_eq!(wp.name, "POI #1");
+        assert!(store.rename(&wp.id, "Quant Rock Alpha"));
+        assert!(store.set_active(Some(&wp.id)));
+        assert_eq!(store.active().unwrap().name, "Quant Rock Alpha");
+
+        let exported = store.export_json().expect("export json");
+        let mut imported_store = WaypointStore::default();
+        assert_eq!(imported_store.import_json(&exported).unwrap(), 1);
+        assert_eq!(imported_store.import_json(&exported).unwrap(), 0); // deduplicated by id
+        assert_eq!(imported_store.waypoints[0].name, "Quant Rock Alpha");
+
+        // 4. Distance formatting (10.0 km -> 9.9 km -> 420 m)
+        assert_eq!(format_distance_m(10_000.0), "10.0 km");
+        assert_eq!(format_distance_m(9_900.0), "9.9 km");
+        assert_eq!(format_distance_m(420.0), "420 m");
+
+        // 5. HeadingTracker + directional math
+        let active_wp = store.active().unwrap().clone();
+        let mut heading = HeadingTracker::default();
+        // Flying straight North (+Y) toward target at (0, 10_000, 500): 10.0 km -> 9.9 km
+        heading.push(SpaceCoord::new(0.0, 0.0, 0.0), 1000.0);
+        heading.push(SpaceCoord::new(0.0, 100.0, 0.0), 2500.0);
+        let g_ahead = WaypointGuidance::build_overlay_info(
+            &active_wp,
+            Some(SpaceCoord::new(0.0, 100.0, 0.0)),
+            &heading,
+            true,
+            2500.0,
+        );
+        assert_eq!(g_ahead.distance_text, "9.9 km");
+        assert_eq!(g_ahead.steering_text, "ON COURSE");
+        assert!(g_ahead.rel_yaw_rad.unwrap().abs() < 0.02);
+        assert!(g_ahead.vertical_text.contains("UP"));
+        assert!(g_ahead.closing_mps.unwrap() > 50.0);
+        assert!(g_ahead.show_ring_marker);
+
+        // Flying North (+Y), target is directly East (+X): should steer RIGHT 90 deg (rel_yaw ~ -pi/2)
+        let east_wp = store.add_point(SpaceCoord::new(5_000.0, 100.0, 0.0), Some("East".into()), None, None, None, t0);
+        let g_right = WaypointGuidance::build_overlay_info(
+            &east_wp,
+            Some(SpaceCoord::new(0.0, 100.0, 0.0)),
+            &heading,
+            true,
+            2500.0,
+        );
+        assert!(g_right.rel_yaw_rad.unwrap() < -1.4);
+        assert!(g_right.steering_text.starts_with("RIGHT"));
+
+        // Target directly West (-X): should steer LEFT 90 deg (rel_yaw ~ +pi/2)
+        let west_wp = store.add_point(SpaceCoord::new(-5_000.0, 100.0, 0.0), Some("West".into()), None, None, None, t0);
+        let g_left = WaypointGuidance::build_overlay_info(
+            &west_wp,
+            Some(SpaceCoord::new(0.0, 100.0, 0.0)),
+            &heading,
+            true,
+            2500.0,
+        );
+        assert!(g_left.rel_yaw_rad.unwrap() > 1.4);
+        assert!(g_left.steering_text.starts_with("LEFT"));
+
+        // Arrived (< 150 m)
+        let g_arrived = WaypointGuidance::build_overlay_info(
+            &active_wp,
+            Some(SpaceCoord::new(0.0, 9_950.0, 500.0)),
+            &heading,
+            true,
+            2500.0,
+        );
+        assert!(g_arrived.arrived);
+        assert_eq!(g_arrived.steering_text, "ARRIVED AT POI");
+        assert!(!g_arrived.show_ring_marker);
+
+        // 6. Verify SoftwareOverlayPainter renders Waypoint HUD card + floating ring marker cleanly
+        let render_settings = AppSettings::default();
+        let social = SocialConfig::default();
+        let wp_model = TestOverlayBuilder::build(
+            &social,
+            1920.0,
+            1080.0,
+            None,
+            TestOverlayPart::Waypoint,
+            Some(&render_settings),
+        );
+        assert!(!wp_model.is_empty());
+        let mut painter = SoftwareOverlayPainter::new();
+        let bgra = painter.paint(&wp_model, &render_settings, 1920, 1080);
+        let visible = bgra.chunks_exact(4).filter(|px| px[3] > 0).count();
+        assert!(visible > 2000, "expected visible waypoint HUD pixels, got {}", visible);
+        assert!(bgra
+            .chunks_exact(4)
+            .all(|px| px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]));
+
+        // 7. Planetary / Moon Zone Locking (zero rotation drift on planets, moons & orbital stations!)
+        use crate::breadcrumbs::{zones_match, LocalBodyStabilizer};
+        use crate::waypoints::LivePositionFix;
+
+        let ruin_di = "\
+            CamDir: -47 22 -129 HOF: 11\n\
+            Zone: MISC_Prospector_952196486641 Pos: -0.01m 9.73m 0.41m\n\
+            Zone: rs_int_p6leo_ruinstation Pos: -22.50m -19.79m -7.33m\n\
+            Zone: pyr06 Pos: -357.1000km 302.1084km -100.0020km\n\
+            Zone: solarsystem_4254651523815 Pos: -48118100.5300km 48502730.2570km -100.0270km\n\
+            Zone: Root Pos: -48118100.5300km 48502730.2570km -100.0270km";
+        let telem = SpaceCoord::parse_display_info_telemetry(ruin_di);
+        assert!(telem.root.is_some());
+        let (disp_z, norm_z, body_c) = telem.body.expect("expected pyr06 planetary container");
+        assert_eq!(disp_z, "pyr06");
+        assert_eq!(norm_z, "pyro6");
+        assert!(zones_match("pyr06", "pyro6"));
+        assert!((body_c.x - (-357_100.0)).abs() < 1.0);
+
+        // LocalBodyStabilizer requires 2 consistent frames then tracks smoothly & rejects glitches
+        let mut bstab = LocalBodyStabilizer::default();
+        assert!(bstab.ingest(disp_z.clone(), norm_z.clone(), body_c, t0).is_none());
+        let (_, _, acc_body) = bstab
+            .ingest("pyro6".to_string(), "pyro6".to_string(), body_c, t0 + Duration::seconds(1))
+            .expect("2nd consistent frame should lock planetary body");
+        assert!(bstab
+            .ingest(
+                "pyro6".to_string(),
+                "pyro6".to_string(),
+                SpaceCoord::new(body_c.x + 900_000.0, body_c.y, body_c.z),
+                t0 + Duration::seconds(2)
+            )
+            .is_none());
+
+        // Save POI on Ruin Station (inside pyr06), then simulate the planet rotating 25 km in Root Pos
+        // while the player stands completely still on Ruin Station (local pyr06 pos unchanged!):
+        let ruin_wp = store.add_point_with_local(
+            telem.root.unwrap().0,
+            Some((disp_z.clone(), acc_body)),
+            Some("Ruin Pad".to_string()),
+            Some(disp_z.clone()),
+            None,
+            Some(OverlayColor::Cyan),
+            t0,
+        );
+        let rotated_root = SpaceCoord::new(
+            telem.root.unwrap().0.x + 25_000.0,
+            telem.root.unwrap().0.y - 12_000.0,
+            telem.root.unwrap().0.z,
+        );
+        let fix_on_station = LivePositionFix {
+            root: Some(rotated_root),
+            body: Some(("pyro6".to_string(), "pyro6".to_string(), acc_body)),
+            display_zone: Some("pyro6".to_string()),
+        };
+        let empty_heading = HeadingTracker::default();
+        let locked_guidance = WaypointGuidance::build_overlay_info_dual(
+            &ruin_wp,
+            &fix_on_station,
+            &empty_heading,
+            &empty_heading,
+            true,
+            5000.0,
+        );
+        assert!(locked_guidance.zone_lock.is_some(), "expected planetary zone lock");
+        assert!(locked_guidance.arrived, "standing still in pyr06 must stay 0m (ARRIVED) despite 25 km Root rotation!");
+        assert!(locked_guidance.distance_m < 1.0);
     }
 }

@@ -5,6 +5,85 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+/// Parsed multi-frame telemetry from Star Citizen's top-right `r_DisplayInfo 2/3` HUD.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayInfoTelemetry {
+    /// Solar-system global coordinates (`Zone: Root Pos:` / `Zone: solarsystem_... Pos:`)
+    /// plus whether both lines agreed within 5 km.
+    pub root: Option<(SpaceCoord, bool)>,
+    /// Innermost rotating planet/moon container (`display_name`, `normalized_key`, `coord_m`),
+    /// e.g. `("pyr06", "pyro6", SpaceCoord)` — stationary relative to that planet/moon & its orbital stations.
+    pub body: Option<(String, String, SpaceCoord)>,
+    /// Most specific human-readable zone label seen (for display/tagging).
+    pub display_zone: Option<String>,
+}
+
+/// Normalizes a Star Citizen body zone name for resilient OCR matching (e.g. `"pyr06"` == `"pyro6"`,
+/// `"Hurst0n"` == `"hurston"`). Keeps digits `1..9` intact while folding `'0'` -> `'o'`.
+pub fn normalize_zone_key(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            let lower = ch.to_ascii_lowercase();
+            if lower == '0' {
+                out.push('o');
+            } else {
+                out.push(lower);
+            }
+        }
+    }
+    out
+}
+
+/// Returns `true` if two Star Citizen zone labels refer to the same astronomical body.
+pub fn zones_match(a: &str, b: &str) -> bool {
+    let na = normalize_zone_key(a);
+    let nb = normalize_zone_key(b);
+    !na.is_empty() && na == nb
+}
+
+fn is_ship_or_interior_zone(zone_name: &str) -> bool {
+    let lower = zone_name.to_ascii_lowercase();
+    if lower.starts_with("rs_")
+        || lower.starts_with("rs")
+            && (lower.contains("int") || lower.contains("refinery") || lower.contains("station"))
+        || lower.starts_with("int_")
+        || lower.starts_with("hangar")
+        || lower.starts_with("hab_")
+        || lower.starts_with("shop_")
+        || lower.starts_with("lobby")
+        || lower.starts_with("elevator")
+        || lower.starts_with("transit")
+        || lower.starts_with("dock")
+        || lower.contains("ruinstation")
+    {
+        return true;
+    }
+
+    const SHIP_PREFIXES: &[&str] = &[
+        "misc_", "drak_", "anvl_", "aegs_", "orig_", "rsi_", "crus_", "argo_", "cnou_", "gama_",
+        "espr_", "mrai_", "banu_", "xian_", "vncl_", "tmbl_", "krig_", "grin_", "tngs_", "xnaa_",
+        "aopo_", "gatc_", "krug_",
+    ];
+    if SHIP_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+
+    // Dynamic vehicle/entity containers carry a long numeric instance ID (>= 6 consecutive digits)
+    let mut run = 0usize;
+    for ch in zone_name.chars() {
+        if ch.is_ascii_digit() {
+            run += 1;
+            if run >= 6 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
 /// 3D coordinates in meters as reported by Star Citizen's `/showlocation` chat command.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SpaceCoord {
@@ -110,6 +189,123 @@ impl SpaceCoord {
             (None, Some(s)) => Some((s, false)),
             (None, None) => fallback_global.map(|c| (c, false)),
         }
+    }
+
+    /// Parses both solar-system `Root Pos` AND the innermost planetary/moon rotating Object Container
+    /// (e.g., `Zone: pyr06 Pos: -357.1km 302.1km -100.0km`) from Star Citizen's `r_DisplayInfo 2/3` OCR.
+    pub fn parse_display_info_telemetry(text: &str) -> DisplayInfoTelemetry {
+        let root = Self::parse_display_info(text);
+        let display_zone = Self::parse_display_info_zone(text);
+        let mut body: Option<(String, String, SpaceCoord)> = None;
+
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            let has_pos = lower.contains("pos") || lower.contains("p0s");
+            if !has_pos {
+                continue;
+            }
+            let is_root = lower.contains("root") || lower.contains("r00t");
+            let is_solar = lower.contains("solarsystem")
+                || lower.contains("solar")
+                || lower.contains("501arsystem")
+                || lower.contains("larsys");
+            if is_root || is_solar {
+                continue;
+            }
+
+            // Extract zone token between "Zone:" and "Pos:"
+            let Some(pos_idx) = lower.find("pos").or_else(|| lower.find("p0s")) else {
+                continue;
+            };
+            let prefix = &line[..pos_idx];
+            let zone_raw = if let Some(z_idx) = prefix.to_ascii_lowercase().find("zone") {
+                prefix[z_idx + 4..].trim_matches(|c: char| {
+                    c == ':' || c == ';' || c == '.' || c.is_whitespace()
+                })
+            } else {
+                // Handle slightly clipped "one: pyr06" / "e: pyr06" OCR prefix
+                prefix
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("")
+                    .trim_matches(|c: char| c == ':' || c == ';' || c == '.')
+            };
+
+            let zone_tok = zone_raw
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| c == ':' || c == ';' || c == ',' || c == '.');
+            if zone_tok.len() < 3 {
+                continue;
+            }
+            let z_low = zone_tok.to_ascii_lowercase();
+            if z_low == "root" || z_low == "r00t" || z_low == "zone" || z_low == "one" {
+                continue;
+            }
+            if is_ship_or_interior_zone(zone_raw) || is_ship_or_interior_zone(zone_tok) {
+                continue;
+            }
+
+            if let Some(coord) = Self::parse_display_info_pos_line(line) {
+                let dist_from_origin_m =
+                    (coord.x * coord.x + coord.y * coord.y + coord.z * coord.z).sqrt();
+                // Planetary/moon surface & orbital coordinates are always >= 10 km from body center
+                // and < 5,000,000 km (rejecting ship/room interiors in meters & Root Pos in tens of Gm).
+                if (10_000.0..=5_000_000_000.0).contains(&dist_from_origin_m) {
+                    let norm_key = normalize_zone_key(zone_tok);
+                    if norm_key.len() >= 3 && body.is_none() {
+                        body = Some((zone_tok.to_string(), norm_key, coord));
+                    }
+                }
+            }
+        }
+
+        let display_zone = body
+            .as_ref()
+            .map(|(z, _, _)| z.clone())
+            .or(display_zone);
+        DisplayInfoTelemetry {
+            root,
+            body,
+            display_zone,
+        }
+    }
+
+    /// Extracts the most specific Star Citizen `Zone: <name>` label from `r_DisplayInfo` OCR text
+    /// (preferring local containers like `rs_refinery_pyro`, falling back to `solarsystem_...`).
+    pub fn parse_display_info_zone(text: &str) -> Option<String> {
+        let mut local_zone: Option<String> = None;
+        let mut solar_zone: Option<String> = None;
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            let lower = line.to_ascii_lowercase();
+            let Some(z_idx) = lower.find("zone") else {
+                continue;
+            };
+            let after = line[z_idx + 4..].trim_start_matches(|c: char| c == ':' || c == ';' || c.is_whitespace());
+            let Some(tok) = after.split_whitespace().next() else {
+                continue;
+            };
+            let clean = tok.trim_matches(|c: char| c == ',' || c == ';' || c == ':');
+            if clean.len() < 3 {
+                continue;
+            }
+            let cl = clean.to_ascii_lowercase();
+            if cl == "root" || cl == "r00t" || cl == "pos" || cl == "pos:" {
+                continue;
+            }
+            if cl.starts_with("solarsystem") || cl.starts_with("solar") {
+                solar_zone = Some(clean.to_string());
+            } else if local_zone.is_none() {
+                local_zone = Some(clean.to_string());
+            }
+        }
+        local_zone.or(solar_zone)
     }
 
     fn parse_three_km_anywhere(line: &str) -> Option<Self> {
@@ -651,6 +847,7 @@ impl BreadcrumbTrail {
             heading_rad: prox.heading_rad,
             show_screen_cloud,
             points: render_points,
+            active_waypoint: None,
         })
     }
 
@@ -771,6 +968,58 @@ impl DisplayInfoStabilizer {
                 }
             }
         }
+    }
+}
+
+/// Filters noisy single-frame OCR glitches on planetary/moon local body coordinates
+/// (`Zone: pyr06 Pos: ...`) while accepting smooth sub-quantum movement and zone transitions.
+#[derive(Debug, Default)]
+pub struct LocalBodyStabilizer {
+    last_accepted: Option<(String, String, SpaceCoord, DateTime<Utc>)>,
+    pending: Option<(String, String, SpaceCoord, DateTime<Utc>)>,
+}
+
+impl LocalBodyStabilizer {
+    pub fn reset(&mut self) {
+        self.last_accepted = None;
+        self.pending = None;
+    }
+
+    /// Validates a planetary/moon body OCR reading `(display_name, norm_key, coord)`.
+    pub fn ingest(
+        &mut self,
+        display_name: String,
+        norm_key: String,
+        coord: SpaceCoord,
+        now: DateTime<Utc>,
+    ) -> Option<(String, String, SpaceCoord)> {
+        if let Some((_, prev_key, prev_coord, prev_ts)) = &self.last_accepted {
+            let dt = (now - *prev_ts).num_seconds().max(1) as f64;
+            if *prev_key == norm_key && dt <= 60.0 {
+                let max_plausible_km = (dt * 2.5).max(15.0);
+                if coord.distance_km(prev_coord) <= max_plausible_km {
+                    let out = (display_name, norm_key, coord);
+                    self.last_accepted = Some((out.0.clone(), out.1.clone(), out.2, now));
+                    self.pending = None;
+                    return Some(out);
+                }
+            }
+        }
+
+        // First reading in a zone or large jump: confirm with 2 consistent frames
+        if let Some((_, pend_key, pend_coord, pend_ts)) = &self.pending {
+            let dt = (now - *pend_ts).num_seconds().max(1) as f64;
+            if *pend_key == norm_key && dt <= 20.0 && coord.distance_km(pend_coord) <= (dt * 2.5).max(15.0)
+            {
+                let out = (display_name, norm_key, coord);
+                self.last_accepted = Some((out.0.clone(), out.1.clone(), out.2, now));
+                self.pending = None;
+                return Some(out);
+            }
+        }
+
+        self.pending = Some((display_name, norm_key, coord, now));
+        None
     }
 }
 

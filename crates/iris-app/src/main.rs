@@ -15,6 +15,7 @@ use iris_core::config::{
     AppSettingsToml, DataPaths, DossierNotes, SocialConfig, SocialConfigToml,
 };
 use iris_core::lookup::{CacheDatabase, RsiClient};
+use iris_core::waypoints::WaypointStore;
 use iris_platform::{IpcCommand, SingleInstanceIpc};
 use parking_lot::{Mutex, RwLock};
 use settings_ui::SettingsWindowState;
@@ -48,6 +49,7 @@ impl CliOptions {
                 "--debug" => opts.ipc_cmd = Some(IpcCommand::ToggleDebugOverlay),
                 "--timed" => opts.ipc_cmd = Some(IpcCommand::TimedOverlay),
                 "--interactive" => opts.ipc_cmd = Some(IpcCommand::InteractiveOverlay),
+                "--save-poi" => opts.ipc_cmd = Some(IpcCommand::SaveWaypoint),
                 "--clear-trail" => opts.ipc_cmd = Some(IpcCommand::ClearBreadcrumbs),
                 "--quit" => opts.ipc_cmd = Some(IpcCommand::Quit),
                 "-h" | "--help" => opts.print_help = true,
@@ -100,6 +102,7 @@ fn main() -> anyhow::Result<()> {
                --debug         Toggle the live Debug / Heartbeat HUD on/off (signals running instance)\n  \
                --timed         Trigger timed overlay peek (signals running instance)\n  \
                --interactive   Open/close Interactive Citizen Dossier (signals running instance)\n  \
+               --save-poi      Save current position as a POI beacon (signals running instance)\n  \
                --clear-trail   Clear recorded /showlocation mining breadcrumbs (signals running instance)\n  \
                --quit          Stop a running SC Overlay instance\n  \
                --portable      Store Config/, Data/, and Logs/ next to the executable\n  \
@@ -153,9 +156,10 @@ fn main() -> anyhow::Result<()> {
             })?,
     );
     let rsi_client = Arc::new(RsiClient::new()?);
+    let waypoints = WaypointStore::load(&paths.waypoints_file());
 
     // Determine whether the Settings window starts visible:
-    // - Hidden if `--minimized` or if launched specifically to run an overlay action (`--toggle`, `--timed`, `--interactive`)
+    // - Hidden if `--minimized` or if launched specifically to run an overlay action (`--toggle`, `--timed`, `--interactive`, `--save-poi`)
     // - Visible on normal launch or `--settings`
     let action_only = matches!(
         cli.ipc_cmd,
@@ -164,6 +168,7 @@ fn main() -> anyhow::Result<()> {
                 | IpcCommand::ToggleDebugOverlay
                 | IpcCommand::TimedOverlay
                 | IpcCommand::InteractiveOverlay
+                | IpcCommand::SaveWaypoint
                 | IpcCommand::ClearBreadcrumbs
         )
     );
@@ -177,6 +182,7 @@ fn main() -> anyhow::Result<()> {
         notes,
         cache,
         rsi_client,
+        waypoints,
         start_settings_open,
         coord_tx,
     );

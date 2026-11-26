@@ -118,6 +118,10 @@ impl DataPaths {
         self.data_dir.join("breadcrumbs.json")
     }
 
+    pub fn waypoints_file(&self) -> PathBuf {
+        self.config_dir.join("waypoints.json")
+    }
+
     pub fn seed_defaults_if_missing(&self) {
         let _ = self.ensure_dirs();
         let seed = |path: PathBuf, content: &str| {

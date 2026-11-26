@@ -46,6 +46,7 @@ pub enum HotkeyAction {
     ToggleOverlay,
     TimedOverlay,
     InteractiveOverlay,
+    SaveWaypoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,7 @@ pub enum TrayAction {
     OpenSettings,
     ToggleOverlay,
     ToggleDebugOverlay,
+    SaveWaypoint,
     ClearBreadcrumbs,
     OpenLogs,
     OpenConfigDir,

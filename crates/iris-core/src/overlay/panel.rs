@@ -4,9 +4,10 @@ use crate::config::social::{
     SocialConfig,
 };
 use crate::models::{
-    BracketItem, BreadcrumbOverlayInfo, BreadcrumbRenderPoint, ColorMatch, DebugBoxKind,
-    DebugCandidateBox, DebugOverlayInfo, DebugStatusLevel, MatchKind, OrgMembership, OverlayModel,
-    PanelEntry, PanelOrgs, PixelRect, ProximityZone,
+    BracketItem, BreadcrumbOverlayInfo, BreadcrumbRenderPoint, BreadcrumbWaypointPin, ColorMatch,
+    DebugBoxKind, DebugCandidateBox, DebugOverlayInfo, DebugStatusLevel, MatchKind, OrgMembership,
+    OverlayColor, OverlayModel, PanelEntry, PanelOrgs, PixelRect, ProximityZone,
+    WaypointOverlayInfo,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -867,6 +868,7 @@ pub enum TestOverlayPart {
     Panel,
     DebugHud,
     Breadcrumbs,
+    Waypoint,
 }
 
 pub struct TestOverlayBuilder;
@@ -1030,11 +1032,13 @@ impl TestOverlayBuilder {
                     panel_entries,
                     mining_labels: Vec::new(),
                     toast: None,
+                    center_toast: None,
                     note: None,
                     boundary_rect: None,
                     dossier_placeholder,
                     debug_info: None,
                     breadcrumb_info: None,
+                    waypoint_info: None,
                 }
             }
             TestOverlayPart::Boundary => OverlayModel {
@@ -1044,11 +1048,13 @@ impl TestOverlayBuilder {
                 panel_entries: Vec::new(),
                 mining_labels: Vec::new(),
                 toast: None,
+                center_toast: None,
                 note: None,
                 boundary_rect: Some(area.to_pixels(screen_width, screen_height)),
                 dossier_placeholder: None,
                 debug_info: None,
                 breadcrumb_info: None,
+                waypoint_info: None,
             },
             TestOverlayPart::DebugHud => {
                 let show_cands = settings.map(|s| s.debug_show_candidates).unwrap_or(false);
@@ -1078,6 +1084,7 @@ impl TestOverlayBuilder {
                     panel_entries: Vec::new(),
                     mining_labels: Vec::new(),
                     toast: None,
+                    center_toast: None,
                     note: None,
                     boundary_rect: None,
                     dossier_placeholder: None,
@@ -1098,6 +1105,7 @@ impl TestOverlayBuilder {
                         scan_boundary,
                     }),
                     breadcrumb_info: None,
+                    waypoint_info: None,
                 }
             }
             TestOverlayPart::Breadcrumbs => {
@@ -1112,6 +1120,7 @@ impl TestOverlayBuilder {
                     panel_entries: Vec::new(),
                     mining_labels: Vec::new(),
                     toast: None,
+                    center_toast: None,
                     note: None,
                     boundary_rect: None,
                     dossier_placeholder: None,
@@ -1123,6 +1132,12 @@ impl TestOverlayBuilder {
                         visited_radius_km: radius,
                         heading_rad: Some(0.65),
                         show_screen_cloud: show_cloud,
+                        active_waypoint: Some(BreadcrumbWaypointPin {
+                            name: "Quant Cluster Alpha".to_string(),
+                            dx_km: 7.4,
+                            dy_km: 6.6,
+                            color: OverlayColor::Cyan,
+                        }),
                         points: vec![
                             BreadcrumbRenderPoint {
                                 id: 1,
@@ -1173,6 +1188,44 @@ impl TestOverlayBuilder {
                                 is_current: true,
                             },
                         ],
+                    }),
+                    waypoint_info: None,
+                }
+            }
+            TestOverlayPart::Waypoint => {
+                let show_ring = settings
+                    .map(|s| s.waypoints_show_ring_marker)
+                    .unwrap_or(true);
+                OverlayModel {
+                    window_width: screen_width as i32,
+                    window_height: screen_height as i32,
+                    brackets: Vec::new(),
+                    panel_entries: Vec::new(),
+                    mining_labels: Vec::new(),
+                    toast: None,
+                    center_toast: None,
+                    note: None,
+                    boundary_rect: None,
+                    dossier_placeholder: None,
+                    debug_info: None,
+                    breadcrumb_info: None,
+                    waypoint_info: Some(WaypointOverlayInfo {
+                        waypoint_id: "preview".to_string(),
+                        name: "Quant Cluster Alpha".to_string(),
+                        color: OverlayColor::Cyan,
+                        has_position_fix: true,
+                        arrived: false,
+                        distance_m: 9_900.0,
+                        distance_text: "9.9 km".to_string(),
+                        steering_text: "RIGHT 28°".to_string(),
+                        vertical_text: "UP +420 m".to_string(),
+                        subline: "RIGHT 28°  |  UP +420 m  |  ETA 0:46  |  ZONE PYRO6".to_string(),
+                        rel_yaw_rad: Some(-28.0_f64.to_radians()),
+                        dz_m: 420.0,
+                        world_bearing_deg: 62.0,
+                        closing_mps: Some(215.0),
+                        zone_lock: Some("pyro6".to_string()),
+                        show_ring_marker: show_ring,
                     }),
                 }
             }

@@ -6,8 +6,10 @@ use iris_core::config::{
     SocialConfigMerger, SocialConfigToml,
 };
 use iris_core::lookup::{CacheDatabase, NotFoundKind, RsiClient, RsiNames, RsiResult};
+use iris_core::models::OverlayColor;
 use iris_core::overlay::TestOverlayPart;
 use iris_core::pipeline::RosterEntry;
+use iris_core::waypoints::{LivePositionFix, WaypointStore};
 use iris_platform::GameWindowInfo;
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +27,11 @@ pub enum CoordinatorCommand {
     ToggleDebugOverlay,
     TimedOverlay,
     OpenInteractive,
+    SaveWaypoint {
+        name: Option<String>,
+        color: Option<OverlayColor>,
+    },
+    WaypointsUpdated,
     ClearBreadcrumbs,
 }
 
@@ -74,6 +81,8 @@ pub struct AppSharedState {
     pub live_roster: RwLock<Vec<RosterEntry>>,
     pub live_diagnostics: RwLock<LiveDiagnosticsSnapshot>,
     pub breadcrumb_summary: RwLock<(usize, String)>,
+    pub waypoints: RwLock<WaypointStore>,
+    pub last_position_fix: RwLock<LivePositionFix>,
     pub status_banner: RwLock<Option<StatusMessage>>,
     pub update_available: RwLock<Option<(String, String)>>,
     pub coordinator_tx: Sender<CoordinatorCommand>,
@@ -88,6 +97,7 @@ impl AppSharedState {
         notes: Arc<RwLock<DossierNotes>>,
         cache: Arc<CacheDatabase>,
         rsi_client: Arc<RsiClient>,
+        waypoints: WaypointStore,
         start_settings_open: bool,
         coordinator_tx: Sender<CoordinatorCommand>,
     ) -> Arc<Self> {
@@ -108,6 +118,8 @@ impl AppSharedState {
             live_roster: RwLock::new(Vec::new()),
             live_diagnostics: RwLock::new(LiveDiagnosticsSnapshot::default()),
             breadcrumb_summary: RwLock::new((0, "No breadcrumbs recorded yet".to_string())),
+            waypoints: RwLock::new(waypoints),
+            last_position_fix: RwLock::new(LivePositionFix::default()),
             status_banner: RwLock::new(None),
             update_available: RwLock::new(None),
             coordinator_tx,
@@ -166,6 +178,16 @@ impl AppSharedState {
         if let Err(err) = guard.save_to(&self.paths.dossier_notes_file()) {
             self.set_status(format!("Failed saving dossier-notes.txt: {}", err), true);
         }
+    }
+
+    pub fn save_waypoints(&self) {
+        let snap = self.waypoints.read().clone();
+        if let Err(err) = snap.save(&self.paths.waypoints_file()) {
+            self.set_status(err, true);
+        } else {
+            let _ = self.coordinator_tx.send(CoordinatorCommand::WaypointsUpdated);
+        }
+        self.request_repaint();
     }
 
     /// Background RSI lookup + verification when adding a player or inspecting a handle in Dossier.
