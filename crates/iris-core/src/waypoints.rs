@@ -1,4 +1,4 @@
-use crate::breadcrumbs::{normalize_zone_key, zones_match, SpaceCoord};
+use crate::breadcrumbs::{normalize_zone_key, planetary_enu_basis, zones_match, SpaceCoord};
 use crate::config::AtomicFile;
 use crate::models::{OverlayColor, WaypointOverlayInfo};
 use chrono::{DateTime, Utc};
@@ -335,11 +335,11 @@ pub struct HeadingTracker {
 }
 
 impl HeadingTracker {
-    const MAX_SAMPLES: usize = 12;
-    const WINDOW_MS: f64 = 6_000.0;
-    const MIN_DISPLACEMENT_M: f64 = 20.0;
-    const HEADING_HOLD_MS: f64 = 25_000.0;
-    const VELOCITY_HOLD_MS: f64 = 4_000.0;
+    const MAX_SAMPLES: usize = 16;
+    const WINDOW_MS: f64 = 2_500.0;
+    const MIN_DISPLACEMENT_M: f64 = 10.0;
+    const HEADING_HOLD_MS: f64 = 2_500.0;
+    const VELOCITY_HOLD_MS: f64 = 2_000.0;
 
     pub fn reset(&mut self) {
         self.samples.clear();
@@ -353,7 +353,7 @@ impl HeadingTracker {
             if last_c.distance_km(&coord) > 500.0 || now_ms < *last_t {
                 self.samples.clear();
                 self.last_valid_velocity = None;
-            } else if last_c.distance_m(&coord) < 0.5 && (now_ms - *last_t) < 250.0 {
+            } else if last_c.distance_m(&coord) < 0.25 && (now_ms - *last_t) < 120.0 {
                 return;
             }
         }
@@ -370,12 +370,12 @@ impl HeadingTracker {
             }
         }
 
-        // Find the most recent prior sample with at least MIN_DISPLACEMENT_M of planar travel
-        // (preferring a ~1.5-3.0 s baseline so turns feel responsive yet smooth).
+        // Find the most recent prior sample with at least MIN_DISPLACEMENT_M of travel
+        // (preferring a crisp ~350-800 ms baseline so turns update immediately without lag).
         let mut best_vel: Option<(f64, f64, f64, f64)> = None;
         for &(prev_c, prev_t) in self.samples.iter().rev().skip(1) {
             let dt_ms = now_ms - prev_t;
-            if dt_ms < 100.0 {
+            if dt_ms < 80.0 {
                 continue;
             }
             let dx = coord.x - prev_c.x;
@@ -385,7 +385,7 @@ impl HeadingTracker {
             if dist_3d >= Self::MIN_DISPLACEMENT_M {
                 let dt_s = dt_ms / 1000.0;
                 best_vel = Some((dx / dt_s, dy / dt_s, dz / dt_s, (dx * dx + dy * dy).sqrt()));
-                if dt_ms >= 1_200.0 {
+                if dt_ms >= 350.0 {
                     break;
                 }
             }
@@ -399,7 +399,7 @@ impl HeadingTracker {
         }
     }
 
-    /// Returns the horizontal travel azimuth `atan2(dy, dx)` in radians if known recently.
+    /// Returns the horizontal travel azimuth `atan2(dy, dx)` in radians if known recently (for deep space).
     pub fn heading_rad(&self, now_ms: f64) -> Option<f64> {
         self.last_valid_yaw
             .filter(|(_, ts)| now_ms - *ts <= Self::HEADING_HOLD_MS)
@@ -412,6 +412,19 @@ impl HeadingTracker {
             .filter(|(_, ts)| now_ms - *ts <= Self::VELOCITY_HOLD_MS)
             .map(|(v, _)| v)
     }
+
+    /// Returns the most recent valid 3D velocity vector within the heading hold window,
+    /// used on spherical planets to project travel heading onto the local ENU tangent plane.
+    pub fn recent_velocity_for_heading(&self, now_ms: f64) -> Option<[f64; 3]> {
+        self.last_valid_velocity
+            .filter(|(_, ts)| now_ms - *ts <= Self::HEADING_HOLD_MS)
+            .map(|(v, _)| v)
+    }
+}
+
+#[inline]
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 /// Computes live HUD guidance for an active `Waypoint` from the ship's current position & heading.
@@ -502,21 +515,76 @@ impl WaypointGuidance {
         let ty = target_coord.y - cur.y;
         let tz = target_coord.z - cur.z;
         let dist_m = (tx * tx + ty * ty + tz * tz).sqrt();
-        let horiz_m = (tx * tx + ty * ty).sqrt();
         let arrived = dist_m <= Self::ARRIVED_RADIUS_M;
         let distance_text = format_distance_m(dist_m);
 
-        // Compass bearing in XY plane: 0° = +Y (North), 90° = +X (East)
-        let target_az = ty.atan2(tx);
-        let world_bearing_deg = (90.0 - target_az.to_degrees()).rem_euclid(360.0);
+        // When locked to a planetary/moon container (`zone_lock.is_some()`), project onto the
+        // local spherical East-North-Up (ENU) surface tangent plane so:
+        // - `world_bearing_deg` matches Star Citizen's real-time top compass bar (0°=N, 90°=E, 180°=S, 270°=W)
+        // - `vertical_delta_m` is true radial altitude difference (||P_target|| - ||P_cur||), NOT polar Z!
+        // - Left/Right steering works accurately at the equator, mid-latitudes, and southern hemisphere.
+        let (horiz_m, vertical_delta_m, world_bearing_deg, rel_yaw_rad, is_planetary) =
+            if zone_lock.is_some() {
+                if let Some((east, north, _up)) = planetary_enu_basis(cur) {
+                    let t_vec = [tx, ty, tz];
+                    let t_e = dot3(t_vec, east);
+                    let t_n = dot3(t_vec, north);
+                    let horiz = (t_e * t_e + t_n * t_n).sqrt();
+                    let r_target = (target_coord.x * target_coord.x
+                        + target_coord.y * target_coord.y
+                        + target_coord.z * target_coord.z)
+                        .sqrt();
+                    let r_cur = (cur.x * cur.x + cur.y * cur.y + cur.z * cur.z).sqrt();
+                    let d_alt = r_target - r_cur;
 
-        let rel_yaw_rad = if arrived || horiz_m < 10.0 {
-            None
-        } else {
-            heading
-                .heading_rad(now_ms)
-                .map(|vel_az| wrap_angle_pi(target_az - vel_az))
-        };
+                    // Compass heading: 0 = North, +pi/2 = East, pi = South, -pi/2 = West
+                    let target_hdg_rad = t_e.atan2(t_n);
+                    let bearing_deg = target_hdg_rad.to_degrees().rem_euclid(360.0);
+
+                    let rel_yaw = if arrived || horiz < 10.0 {
+                        None
+                    } else {
+                        heading.recent_velocity_for_heading(now_ms).and_then(|v| {
+                            let v_e = dot3(v, east);
+                            let v_n = dot3(v, north);
+                            // Require deliberate forward travel (>= 6 m/s) so hovering / strafing /
+                            // turning in place never freezes a stale reverse arrow.
+                            if (v_e * v_e + v_n * v_n).sqrt() >= 6.0 {
+                                let vel_hdg_rad = v_e.atan2(v_n);
+                                // rel_yaw < 0 => RIGHT, rel_yaw > 0 => LEFT
+                                Some(wrap_angle_pi(vel_hdg_rad - target_hdg_rad))
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    (horiz, d_alt, bearing_deg, rel_yaw, true)
+                } else {
+                    let horiz = (tx * tx + ty * ty).sqrt();
+                    let target_az = ty.atan2(tx);
+                    let bearing_deg = (90.0 - target_az.to_degrees()).rem_euclid(360.0);
+                    let rel_yaw = if arrived || horiz < 10.0 {
+                        None
+                    } else {
+                        heading
+                            .heading_rad(now_ms)
+                            .map(|vel_az| wrap_angle_pi(target_az - vel_az))
+                    };
+                    (horiz, tz, bearing_deg, rel_yaw, false)
+                }
+            } else {
+                let horiz = (tx * tx + ty * ty).sqrt();
+                let target_az = ty.atan2(tx);
+                let bearing_deg = (90.0 - target_az.to_degrees()).rem_euclid(360.0);
+                let rel_yaw = if arrived || horiz < 10.0 {
+                    None
+                } else {
+                    heading
+                        .heading_rad(now_ms)
+                        .map(|vel_az| wrap_angle_pi(target_az - vel_az))
+                };
+                (horiz, tz, bearing_deg, rel_yaw, false)
+            };
 
         // Closing rate along line of sight: dot(vel, unit_to_target)
         let closing_mps = if dist_m >= 1.0 {
@@ -545,26 +613,33 @@ impl WaypointGuidance {
                 format!("LEFT {}°", abs_deg)
             }
         } else if horiz_m < 10.0 {
-            if tz >= 0.0 {
+            if vertical_delta_m >= 0.0 {
                 "DIRECTLY ABOVE".to_string()
             } else {
                 "DIRECTLY BELOW".to_string()
             }
+        } else if is_planetary {
+            format!("FLY HDG {:03.0}°", world_bearing_deg)
         } else {
             format!("HDG {:03.0}° (FLY TO LOCK)", world_bearing_deg)
         };
 
         let vertical_text = if arrived {
             "ON TARGET".to_string()
-        } else if tz.abs() < 40.0 {
+        } else if vertical_delta_m.abs() < 35.0 {
             "LEVEL".to_string()
-        } else if tz > 0.0 {
-            format!("UP +{}", format_distance_m(tz))
+        } else if vertical_delta_m > 0.0 {
+            format!("UP +{}", format_distance_m(vertical_delta_m))
         } else {
-            format!("DOWN -{}", format_distance_m(tz.abs()))
+            format!("DOWN -{}", format_distance_m(vertical_delta_m.abs()))
         };
 
-        let mut parts = vec![steering_text.clone()];
+        let mut parts: Vec<String> = Vec::new();
+        // On planets/moons, always show the zero-lag compass heading matching SC's top compass bar!
+        if is_planetary && !arrived && horiz_m >= 10.0 && rel_yaw_rad.is_some() {
+            parts.push(format!("HDG {:03.0}°", world_bearing_deg));
+        }
+        parts.push(steering_text.clone());
         if !vertical_text.is_empty() && !arrived {
             parts.push(vertical_text.clone());
         }
@@ -593,7 +668,7 @@ impl WaypointGuidance {
             vertical_text,
             subline,
             rel_yaw_rad,
-            dz_m: tz,
+            dz_m: vertical_delta_m,
             world_bearing_deg,
             closing_mps,
             zone_lock,

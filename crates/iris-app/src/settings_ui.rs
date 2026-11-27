@@ -33,9 +33,12 @@ pub enum SettingsTab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordingHotkey {
     Toggle,
+    TogglePlayersOrgs,
     Timed,
     Interactive,
     SaveWaypoint,
+    RadarZoomIn,
+    RadarZoomOut,
 }
 
 pub struct SettingsWindowState {
@@ -106,7 +109,7 @@ impl SettingsWindowState {
         self.render_header(ui, p, shared);
         ui.add_space(6.0);
         self.render_banners(ui, p, shared);
-        self.render_tab_bar(ui, p);
+        self.render_tab_bar(ui, p, shared);
         ui.add_space(8.0);
 
         match self.active_tab {
@@ -258,7 +261,12 @@ impl SettingsWindowState {
         }
     }
 
-    fn render_tab_bar(&mut self, ui: &mut egui::Ui, p: &ThemePalette) {
+    fn render_tab_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &ThemePalette,
+        shared: &Arc<AppSharedState>,
+    ) {
         egui::Frame::none()
             .fill(p.surface)
             .stroke(Stroke::new(1.0, p.border))
@@ -284,8 +292,65 @@ impl SettingsWindowState {
                             self.active_tab = tab;
                         }
                     }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut players_orgs_enabled = shared.settings.read().players_orgs_enabled;
+                        let lbl = if players_orgs_enabled {
+                            RichText::new("Players & Orgs Active").size(12.5).color(p.text)
+                        } else {
+                            RichText::new("Players & Orgs Off (CPU Saver)")
+                                .size(12.5)
+                                .color(OverlayColor::Orange.rgb().into_color32())
+                        };
+                        if ui
+                            .checkbox(&mut players_orgs_enabled, lbl)
+                            .on_hover_text(
+                                "Toggle live player/org nameplate OCR, tracking, brackets, and side panel. Disable to skip scanning and save CPU cycles while keeping Mining, Breadcrumbs, and Waypoints available.",
+                            )
+                            .changed()
+                        {
+                            let _ = shared
+                                .coordinator_tx
+                                .send(CoordinatorCommand::TogglePlayersOrgs);
+                        }
+                    });
                 });
             });
+    }
+
+    fn render_players_orgs_paused_banner(
+        ui: &mut egui::Ui,
+        p: &ThemePalette,
+        shared: &Arc<AppSharedState>,
+    ) {
+        if shared.settings.read().players_orgs_enabled {
+            return;
+        }
+        let warn = OverlayColor::Orange.rgb().into_color32();
+        egui::Frame::none()
+            .fill(warn.gamma_multiply(0.14))
+            .stroke(Stroke::new(1.0, warn))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(Margin::symmetric(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(
+                            "Players & Orgs overlay is OFF (CPU Saver) — nameplate OCR, tracking, brackets, and side panel are paused.",
+                        )
+                        .size(12.5)
+                        .color(p.text),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Resume Players & Orgs").clicked() {
+                            let _ = shared
+                                .coordinator_tx
+                                .send(CoordinatorCommand::TogglePlayersOrgs);
+                        }
+                    });
+                });
+            });
+        ui.add_space(6.0);
     }
 
     // ========================================================================
@@ -297,6 +362,8 @@ impl SettingsWindowState {
         p: &ThemePalette,
         shared: &Arc<AppSharedState>,
     ) {
+        Self::render_players_orgs_paused_banner(ui, p, shared);
+
         egui::Frame::none()
             .fill(p.surface)
             .stroke(Stroke::new(1.0, p.border))
@@ -465,6 +532,8 @@ impl SettingsWindowState {
         p: &ThemePalette,
         shared: &Arc<AppSharedState>,
     ) {
+        Self::render_players_orgs_paused_banner(ui, p, shared);
+
         let active_colors = {
             let social = shared.social.read();
             ColorRanks::active_org_colors(&social.orgs)
@@ -656,6 +725,8 @@ impl SettingsWindowState {
         p: &ThemePalette,
         shared: &Arc<AppSharedState>,
     ) {
+        Self::render_players_orgs_paused_banner(ui, p, shared);
+
         let active_colors = {
             let social = shared.social.read();
             ColorRanks::active_rule_colors(&social.org_rules)
@@ -1413,6 +1484,19 @@ impl SettingsWindowState {
                             self.hotkey_row(
                                 ui,
                                 p,
+                                "Toggle Players & Orgs On/Off:",
+                                &s.hotkey_toggle_players_orgs,
+                                RecordingHotkey::TogglePlayersOrgs,
+                            );
+                            if ui.small_button("Reset (Shift+F11)").clicked() {
+                                s.hotkey_toggle_players_orgs = "Shift+F11".to_string();
+                                changed = true;
+                            }
+                            ui.end_row();
+
+                            self.hotkey_row(
+                                ui,
+                                p,
                                 "Timed Peek (when disabled):",
                                 &s.hotkey_timed_overlay,
                                 RecordingHotkey::Timed,
@@ -1445,6 +1529,32 @@ impl SettingsWindowState {
                             );
                             if ui.small_button("Reset (Alt+Shift+P)").clicked() {
                                 s.hotkey_save_waypoint = "Alt+Shift+P".to_string();
+                                changed = true;
+                            }
+                            ui.end_row();
+
+                            self.hotkey_row(
+                                ui,
+                                p,
+                                "Breadcrumb Radar Zoom In:",
+                                &s.hotkey_radar_zoom_in,
+                                RecordingHotkey::RadarZoomIn,
+                            );
+                            if ui.small_button("Reset (Alt+Shift+[)").clicked() {
+                                s.hotkey_radar_zoom_in = "Alt+Shift+[".to_string();
+                                changed = true;
+                            }
+                            ui.end_row();
+
+                            self.hotkey_row(
+                                ui,
+                                p,
+                                "Breadcrumb Radar Zoom Out:",
+                                &s.hotkey_radar_zoom_out,
+                                RecordingHotkey::RadarZoomOut,
+                            );
+                            if ui.small_button("Reset (Alt+Shift+])").clicked() {
+                                s.hotkey_radar_zoom_out = "Alt+Shift+]".to_string();
                                 changed = true;
                             }
                             ui.end_row();
@@ -1594,7 +1704,40 @@ impl SettingsWindowState {
 
                 ui.add_space(10.0);
 
-                // 3. Screen Capture & Platform
+                // 3. Players & Orgs Nameplate Overlay (CPU Saver Toggle)
+                Self::section_card(
+                    ui,
+                    p,
+                    "PLAYERS & ORGS OVERLAY (NAMEPLATES & SIDE PANEL)",
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .checkbox(
+                                    &mut s.players_orgs_enabled,
+                                    "Enable Players & Orgs Nameplate Scanner & Overlay",
+                                )
+                                .on_hover_text(
+                                    "Runs real-time nameplate OCR, sub-pixel tracking, RSI lookups, brackets, and the right-side panel. Disable to save CPU cycles when you only want Mining, Breadcrumbs, or Waypoints.",
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "When disabled, nameplate OCR, tracking, and automatic RSI lookups are completely skipped and screen capture rate drops automatically (or pauses completely if Mining & Auto-DisplayInfo are also off).",
+                            )
+                            .size(11.5)
+                            .color(p.muted),
+                        );
+                    },
+                );
+
+                ui.add_space(10.0);
+
+                // 3a. Screen Capture & Platform
                 Self::section_card(ui, p, "SCREEN CAPTURE & TRACKING PERFORMANCE", |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Capture Backend:");
@@ -2238,6 +2381,45 @@ impl SettingsWindowState {
                         );
                     });
 
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Radar Window Scale:")
+                            .on_hover_text(
+                                "Sets the radius (center to edge) of the 2D breadcrumb radar window from 1 km up to 1000 km — useful for zooming out to see wide areas or teammates. Zoom live in-game with Alt+Shift+[ and Alt+Shift+].",
+                            );
+                        let is_auto = s.breadcrumbs_radar_range_km == 0;
+                        let auto_txt = RichText::new("Auto")
+                            .size(12.0)
+                            .color(if is_auto { p.accent } else { p.text });
+                        if ui
+                            .add_enabled(
+                                s.breadcrumbs_enabled,
+                                egui::SelectableLabel::new(is_auto, auto_txt),
+                            )
+                            .on_hover_text("Automatic local zoom (3× visited cloud radius, min 10 km)")
+                            .clicked()
+                        {
+                            s.breadcrumbs_radar_range_km = 0;
+                            changed = true;
+                        }
+                        for &km in &AppSettings::BREADCRUMB_RADAR_SCALES_KM {
+                            let selected = s.breadcrumbs_radar_range_km == km;
+                            let lbl = RichText::new(format!("{} km", km))
+                                .size(12.0)
+                                .color(if selected { p.accent } else { p.text });
+                            if ui
+                                .add_enabled(
+                                    s.breadcrumbs_enabled,
+                                    egui::SelectableLabel::new(selected, lbl),
+                                )
+                                .clicked()
+                            {
+                                s.breadcrumbs_radar_range_km = km;
+                                changed = true;
+                            }
+                        }
+                    });
+
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(
@@ -2515,11 +2697,16 @@ impl SettingsWindowState {
                         let mut s = shared.settings.write();
                         match which {
                             RecordingHotkey::Toggle => s.hotkey_toggle_overlay = formatted,
+                            RecordingHotkey::TogglePlayersOrgs => {
+                                s.hotkey_toggle_players_orgs = formatted
+                            }
                             RecordingHotkey::Timed => s.hotkey_timed_overlay = formatted,
                             RecordingHotkey::Interactive => {
                                 s.hotkey_interactive_overlay = formatted
                             }
                             RecordingHotkey::SaveWaypoint => s.hotkey_save_waypoint = formatted,
+                            RecordingHotkey::RadarZoomIn => s.hotkey_radar_zoom_in = formatted,
+                            RecordingHotkey::RadarZoomOut => s.hotkey_radar_zoom_out = formatted,
                         }
                     }
                     shared.save_settings(false);

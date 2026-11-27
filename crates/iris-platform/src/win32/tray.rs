@@ -1,6 +1,6 @@
 use crate::{TrayAction, TrayBackend, TRAY_OFF_ICO, TRAY_ON_ICO};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use windows::core::PCWSTR;
@@ -35,10 +35,14 @@ const ID_QUIT: usize = 1005;
 const ID_DEBUG: usize = 1006;
 const ID_CLEAR_BREADCRUMBS: usize = 1007;
 const ID_SAVE_WAYPOINT: usize = 1008;
+const ID_TOGGLE_PLAYERS: usize = 1009;
+const ID_CYCLE_RADAR_SCALE: usize = 1010;
 
 struct TrayThreadShared {
     overlay_enabled: Arc<AtomicBool>,
+    players_orgs_enabled: Arc<AtomicBool>,
     debug_enabled: Arc<AtomicBool>,
+    radar_range_km: Arc<AtomicI32>,
     tx: Sender<TrayAction>,
     icon_on: HICON,
     icon_off: HICON,
@@ -52,19 +56,30 @@ static TRAY_SHARED: OnceLock<TrayThreadShared> = OnceLock::new();
 pub struct Win32TrayBackend {
     hwnd: isize,
     overlay_enabled: Arc<AtomicBool>,
+    players_orgs_enabled: Arc<AtomicBool>,
     debug_enabled: Arc<AtomicBool>,
+    radar_range_km: Arc<AtomicI32>,
     rx: Receiver<TrayAction>,
 }
 
 impl Win32TrayBackend {
-    pub fn new(overlay_enabled: bool, debug_enabled: bool) -> anyhow::Result<Self> {
+    pub fn new(
+        overlay_enabled: bool,
+        players_orgs_enabled: bool,
+        debug_enabled: bool,
+        radar_range_km: i32,
+    ) -> anyhow::Result<Self> {
         let enabled_flag = Arc::new(AtomicBool::new(overlay_enabled));
+        let players_flag = Arc::new(AtomicBool::new(players_orgs_enabled));
         let debug_flag = Arc::new(AtomicBool::new(debug_enabled));
+        let radar_km = Arc::new(AtomicI32::new(radar_range_km));
         let (tx, rx) = unbounded();
         let (hwnd_tx, hwnd_rx) = crossbeam_channel::bounded::<anyhow::Result<isize>>(1);
 
         let flag_clone = Arc::clone(&enabled_flag);
+        let players_clone = Arc::clone(&players_flag);
         let debug_clone = Arc::clone(&debug_flag);
+        let radar_clone = Arc::clone(&radar_km);
         thread::Builder::new()
             .name("sc-overlay-win32-tray".to_string())
             .spawn(move || unsafe {
@@ -73,7 +88,9 @@ impl Win32TrayBackend {
 
                 let _ = TRAY_SHARED.set(TrayThreadShared {
                     overlay_enabled: Arc::clone(&flag_clone),
+                    players_orgs_enabled: Arc::clone(&players_clone),
                     debug_enabled: Arc::clone(&debug_clone),
+                    radar_range_km: Arc::clone(&radar_clone),
                     tx,
                     icon_on,
                     icon_off,
@@ -145,7 +162,9 @@ impl Win32TrayBackend {
         Ok(Self {
             hwnd,
             overlay_enabled: enabled_flag,
+            players_orgs_enabled: players_flag,
             debug_enabled: debug_flag,
+            radar_range_km: radar_km,
             rx,
         })
     }
@@ -164,8 +183,16 @@ impl TrayBackend for Win32TrayBackend {
         }
     }
 
+    fn set_players_orgs_enabled(&mut self, enabled: bool) {
+        self.players_orgs_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     fn set_debug_enabled(&mut self, enabled: bool) {
         self.debug_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_radar_range_km(&mut self, range_km: i32) {
+        self.radar_range_km.store(range_km, Ordering::Relaxed);
     }
 
     fn try_recv(&self) -> Option<TrayAction> {
@@ -260,6 +287,12 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
     } else {
         "Enable Overlay\0"
     };
+    let players_on = shared.players_orgs_enabled.load(Ordering::Relaxed);
+    let players_label = if players_on {
+        "Disable Players & Orgs\0"
+    } else {
+        "Enable Players & Orgs\0"
+    };
     let debug_on = shared.debug_enabled.load(Ordering::Relaxed);
     let debug_label = if debug_on {
         "Hide Debug HUD\0"
@@ -267,10 +300,19 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
         "Show Debug HUD\0"
     };
 
+    let radar_km = shared.radar_range_km.load(Ordering::Relaxed);
+    let radar_label = if radar_km <= 0 {
+        "Breadcrumb Scale: Auto (Next)\0".to_string()
+    } else {
+        format!("Breadcrumb Scale: {} km (Next)\0", radar_km)
+    };
+
     let w_settings: Vec<u16> = "Settings…\0".encode_utf16().collect();
     let w_toggle: Vec<u16> = toggle_label.encode_utf16().collect();
+    let w_players: Vec<u16> = players_label.encode_utf16().collect();
     let w_debug: Vec<u16> = debug_label.encode_utf16().collect();
     let w_save_poi: Vec<u16> = "Save POI at Current Position\0".encode_utf16().collect();
+    let w_radar_scale: Vec<u16> = radar_label.encode_utf16().collect();
     let w_clear_trail: Vec<u16> = "Clear Breadcrumb Trail\0".encode_utf16().collect();
     let w_logs: Vec<u16> = "Open log folder\0".encode_utf16().collect();
     let w_cfg: Vec<u16> = "Open config location\0".encode_utf16().collect();
@@ -278,12 +320,24 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
 
     let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, PCWSTR(w_settings.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, PCWSTR(w_toggle.as_ptr()));
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_TOGGLE_PLAYERS,
+        PCWSTR(w_players.as_ptr()),
+    );
     let _ = AppendMenuW(menu, MF_STRING, ID_DEBUG, PCWSTR(w_debug.as_ptr()));
     let _ = AppendMenuW(
         menu,
         MF_STRING,
         ID_SAVE_WAYPOINT,
         PCWSTR(w_save_poi.as_ptr()),
+    );
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_CYCLE_RADAR_SCALE,
+        PCWSTR(w_radar_scale.as_ptr()),
     );
     let _ = AppendMenuW(
         menu,
@@ -319,11 +373,17 @@ unsafe fn show_context_menu(hwnd: HWND, shared: &TrayThreadShared) {
         ID_TOGGLE => {
             let _ = shared.tx.send(TrayAction::ToggleOverlay);
         }
+        ID_TOGGLE_PLAYERS => {
+            let _ = shared.tx.send(TrayAction::TogglePlayersOrgs);
+        }
         ID_DEBUG => {
             let _ = shared.tx.send(TrayAction::ToggleDebugOverlay);
         }
         ID_SAVE_WAYPOINT => {
             let _ = shared.tx.send(TrayAction::SaveWaypoint);
+        }
+        ID_CYCLE_RADAR_SCALE => {
+            let _ = shared.tx.send(TrayAction::CycleRadarScale);
         }
         ID_CLEAR_BREADCRUMBS => {
             let _ = shared.tx.send(TrayAction::ClearBreadcrumbs);

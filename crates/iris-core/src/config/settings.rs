@@ -61,16 +61,22 @@ pub struct AppSettings {
     pub settings_window_scale: i32,
     pub settings_dark_mode: DarkMode,
     pub overlay_disabled: bool,
+    pub players_orgs_enabled: bool,
     pub hotkey_toggle_overlay: String,
+    pub hotkey_toggle_players_orgs: String,
     pub hotkey_timed_overlay: String,
     pub hotkey_interactive_overlay: String,
     pub hotkey_save_waypoint: String,
+    pub hotkey_radar_zoom_in: String,
+    pub hotkey_radar_zoom_out: String,
     pub timed_overlay_seconds: i32,
     pub mining_disabled: bool,
     pub mining_label_zoom_percent: i32,
     pub breadcrumbs_enabled: bool,
     pub breadcrumbs_persist: bool,
     pub breadcrumbs_visited_radius_km: i32,
+    /// Breadcrumb 2D radar window radius in km (`0` = Auto: 3x visited radius, min 10 km; `1..=1000` = fixed range).
+    pub breadcrumbs_radar_range_km: i32,
     pub breadcrumbs_screen_cloud: bool,
     pub breadcrumbs_auto_displayinfo: bool,
     pub breadcrumbs_auto_interval_secs: i32,
@@ -108,12 +114,74 @@ impl AppSettings {
     pub const MINING_ZOOM_STEP: i32 = 10;
     pub const BREADCRUMB_RADIUS_MIN_KM: i32 = 1;
     pub const BREADCRUMB_RADIUS_MAX_KM: i32 = 25;
+    pub const BREADCRUMB_RADAR_RANGE_MIN_KM: i32 = 0;
+    pub const BREADCRUMB_RADAR_RANGE_MAX_KM: i32 = 1000;
+    pub const BREADCRUMB_RADAR_SCALES_KM: [i32; 10] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000];
     pub const BREADCRUMB_INTERVAL_MIN_SECS: i32 = 5;
     pub const BREADCRUMB_INTERVAL_MAX_SECS: i32 = 120;
     pub const WINDOW_SCALES: [i32; 5] = [100, 110, 125, 150, 175];
 
     pub fn overlay_shown_in_capture(&self) -> bool {
         self.overlay_visible_in_capture && self.capture_method == CaptureMethod::WindowCapture
+    }
+
+    /// Effective 2D breadcrumb radar radius (center to edge) in km.
+    pub fn effective_breadcrumb_radar_km(&self) -> f64 {
+        if self.breadcrumbs_radar_range_km > 0 {
+            self.breadcrumbs_radar_range_km.clamp(1, Self::BREADCRUMB_RADAR_RANGE_MAX_KM) as f64
+        } else {
+            (self.breadcrumbs_visited_radius_km.max(1) as f64 * 3.0).max(10.0)
+        }
+    }
+
+    /// Steps the radar range setting up (`delta > 0` = zoom out) or down (`delta < 0` = zoom in)
+    /// across `BREADCRUMB_RADAR_SCALES_KM`. When `wrap` is true (e.g. tray cycle), wraps past 1000 km back to `0` (Auto).
+    pub fn step_breadcrumb_radar_km(
+        current_km: i32,
+        visited_radius_km: i32,
+        delta: i32,
+        wrap: bool,
+    ) -> i32 {
+        let effective = if current_km > 0 {
+            current_km
+        } else {
+            (visited_radius_km.max(1) * 3).max(10)
+        };
+        if delta > 0 {
+            if let Some(&next) = Self::BREADCRUMB_RADAR_SCALES_KM
+                .iter()
+                .find(|&&v| v > effective)
+            {
+                next
+            } else if wrap {
+                0
+            } else {
+                *Self::BREADCRUMB_RADAR_SCALES_KM.last().unwrap_or(&1000)
+            }
+        } else if delta < 0 {
+            if let Some(&prev) = Self::BREADCRUMB_RADAR_SCALES_KM
+                .iter()
+                .rev()
+                .find(|&&v| v < effective)
+            {
+                prev
+            } else if wrap {
+                *Self::BREADCRUMB_RADAR_SCALES_KM.last().unwrap_or(&1000)
+            } else {
+                Self::BREADCRUMB_RADAR_SCALES_KM[0]
+            }
+        } else {
+            current_km
+        }
+    }
+
+    pub fn format_breadcrumb_radar_scale(scale_km: i32, visited_radius_km: i32) -> String {
+        if scale_km <= 0 {
+            let eff = (visited_radius_km.max(1) * 3).max(10);
+            format!("Auto ({} km)", eff)
+        } else {
+            format!("{} km", scale_km)
+        }
     }
 }
 
@@ -147,16 +215,21 @@ impl Default for AppSettings {
             settings_window_scale: 100,
             settings_dark_mode: DarkMode::System,
             overlay_disabled: false,
+            players_orgs_enabled: true,
             hotkey_toggle_overlay: "Shift+F12".to_string(),
+            hotkey_toggle_players_orgs: "Shift+F11".to_string(),
             hotkey_timed_overlay: "Tab".to_string(),
             hotkey_interactive_overlay: "Shift+0".to_string(),
             hotkey_save_waypoint: "Alt+Shift+P".to_string(),
+            hotkey_radar_zoom_in: "Alt+Shift+[".to_string(),
+            hotkey_radar_zoom_out: "Alt+Shift+]".to_string(),
             timed_overlay_seconds: 10,
             mining_disabled: false,
             mining_label_zoom_percent: 150,
             breadcrumbs_enabled: true,
             breadcrumbs_persist: true,
             breadcrumbs_visited_radius_km: 5,
+            breadcrumbs_radar_range_km: 0,
             breadcrumbs_screen_cloud: true,
             breadcrumbs_auto_displayinfo: true,
             breadcrumbs_auto_interval_secs: 15,
@@ -324,8 +397,16 @@ impl AppSettingsToml {
             bool_str(settings.overlay_disabled)
         ));
         out.push_str(&format!(
+            "players_orgs_enabled = {}\n",
+            bool_str(settings.players_orgs_enabled)
+        ));
+        out.push_str(&format!(
             "hotkey_toggle_overlay = {}\n",
             quote(&HotkeyText::normalize(&settings.hotkey_toggle_overlay))
+        ));
+        out.push_str(&format!(
+            "hotkey_toggle_players_orgs = {}\n",
+            quote(&HotkeyText::normalize(&settings.hotkey_toggle_players_orgs))
         ));
         out.push_str(&format!(
             "hotkey_timed_overlay = {}\n",
@@ -338,6 +419,14 @@ impl AppSettingsToml {
         out.push_str(&format!(
             "hotkey_save_waypoint = {}\n",
             quote(&HotkeyText::normalize(&settings.hotkey_save_waypoint))
+        ));
+        out.push_str(&format!(
+            "hotkey_radar_zoom_in = {}\n",
+            quote(&HotkeyText::normalize(&settings.hotkey_radar_zoom_in))
+        ));
+        out.push_str(&format!(
+            "hotkey_radar_zoom_out = {}\n",
+            quote(&HotkeyText::normalize(&settings.hotkey_radar_zoom_out))
         ));
         out.push_str(&format!(
             "timed_overlay_seconds = {}\n",
@@ -371,6 +460,13 @@ impl AppSettingsToml {
             settings.breadcrumbs_visited_radius_km.clamp(
                 AppSettings::BREADCRUMB_RADIUS_MIN_KM,
                 AppSettings::BREADCRUMB_RADIUS_MAX_KM
+            )
+        ));
+        out.push_str(&format!(
+            "breadcrumbs_radar_range_km = {}\n",
+            settings.breadcrumbs_radar_range_km.clamp(
+                AppSettings::BREADCRUMB_RADAR_RANGE_MIN_KM,
+                AppSettings::BREADCRUMB_RADAR_RANGE_MAX_KM
             )
         ));
         out.push_str(&format!(
@@ -674,10 +770,22 @@ impl AppSettingsToml {
 
         s.overlay_disabled =
             read_bool(&root, "overlay_disabled", defaults.overlay_disabled, &mut warnings);
+        s.players_orgs_enabled = read_bool(
+            &root,
+            "players_orgs_enabled",
+            defaults.players_orgs_enabled,
+            &mut warnings,
+        );
         s.hotkey_toggle_overlay = read_hotkey(
             &root,
             "hotkey_toggle_overlay",
             &defaults.hotkey_toggle_overlay,
+            &mut warnings,
+        );
+        s.hotkey_toggle_players_orgs = read_hotkey(
+            &root,
+            "hotkey_toggle_players_orgs",
+            &defaults.hotkey_toggle_players_orgs,
             &mut warnings,
         );
         s.hotkey_timed_overlay = read_hotkey(
@@ -696,6 +804,18 @@ impl AppSettingsToml {
             &root,
             "hotkey_save_waypoint",
             &defaults.hotkey_save_waypoint,
+            &mut warnings,
+        );
+        s.hotkey_radar_zoom_in = read_hotkey(
+            &root,
+            "hotkey_radar_zoom_in",
+            &defaults.hotkey_radar_zoom_in,
+            &mut warnings,
+        );
+        s.hotkey_radar_zoom_out = read_hotkey(
+            &root,
+            "hotkey_radar_zoom_out",
+            &defaults.hotkey_radar_zoom_out,
             &mut warnings,
         );
         s.timed_overlay_seconds = read_int(
@@ -739,6 +859,14 @@ impl AppSettingsToml {
             defaults.breadcrumbs_visited_radius_km,
             AppSettings::BREADCRUMB_RADIUS_MIN_KM,
             AppSettings::BREADCRUMB_RADIUS_MAX_KM,
+            &mut warnings,
+        );
+        s.breadcrumbs_radar_range_km = read_int(
+            &root,
+            "breadcrumbs_radar_range_km",
+            defaults.breadcrumbs_radar_range_km,
+            AppSettings::BREADCRUMB_RADAR_RANGE_MIN_KM,
+            AppSettings::BREADCRUMB_RADAR_RANGE_MAX_KM,
             &mut warnings,
         );
         s.breadcrumbs_screen_cloud = read_bool(

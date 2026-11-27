@@ -2,8 +2,8 @@ use crate::state::{AppSharedState, CoordinatorCommand, LiveDiagnosticsSnapshot};
 use chrono::{Duration as ChronoDuration, Utc};
 use crossbeam_channel::Receiver;
 use iris_core::breadcrumbs::{
-    zones_match, BreadcrumbTrail, DisplayInfoStabilizer, LocalBodyStabilizer, RecordOutcome,
-    SpaceCoord,
+    planetary_enu_basis, zones_match, BreadcrumbTrail, DisplayInfoStabilizer, LocalBodyStabilizer,
+    RecordOutcome, SpaceCoord,
 };
 use iris_core::config::{AppSettings, CaptureMethod};
 use iris_core::models::{
@@ -86,6 +86,7 @@ fn run_coordinator_loop(
             breadcrumbs
                 .build_overlay_info(
                     initial_settings.breadcrumbs_visited_radius_km as f64,
+                    initial_settings.effective_breadcrumb_radar_km(),
                     initial_settings.breadcrumbs_screen_cloud,
                     None,
                     Utc::now(),
@@ -97,7 +98,9 @@ fn run_coordinator_loop(
     }
     let mut tray = match create_tray_backend(
         !initial_settings.overlay_disabled,
+        initial_settings.players_orgs_enabled,
         initial_settings.debug_overlay_enabled,
+        initial_settings.breadcrumbs_radar_range_km,
     ) {
         Ok(t) => Some(t),
         Err(e) => {
@@ -131,6 +134,7 @@ fn run_coordinator_loop(
     let mut last_drawn_bounds = IntRect::default();
     let mut last_drawn_vis_cap = false;
     let mut last_roster_len = 0usize;
+    let mut capturer_active = false;
 
     // Live pipeline & capture diagnostics
     let mut coordinator_ticks: u64 = 0;
@@ -189,6 +193,36 @@ fn run_coordinator_loop(
         shared.save_settings(false);
     };
 
+    let apply_players_orgs_toggle = |shared: &Arc<AppSharedState>,
+                                     tray: &mut Option<Box<dyn iris_platform::TrayBackend>>,
+                                     pipeline: &mut LiveDetectionPipeline,
+                                     last_roster_len: &mut usize,
+                                     transient_toast: &mut Option<(String, f64)>,
+                                     now_ms: f64| {
+        let new_enabled = {
+            let mut s = shared.settings.write();
+            s.players_orgs_enabled = !s.players_orgs_enabled;
+            s.players_orgs_enabled
+        };
+        if !new_enabled {
+            pipeline.reset_nameplate_tracking();
+            if *last_roster_len != 0 {
+                *last_roster_len = 0;
+                shared.live_roster.write().clear();
+            }
+        }
+        if let Some(t) = tray.as_mut() {
+            t.set_players_orgs_enabled(new_enabled);
+        }
+        let msg = if new_enabled {
+            "Players & Orgs ENABLED"
+        } else {
+            "Players & Orgs DISABLED (CPU Saver)"
+        };
+        *transient_toast = Some((msg.to_string(), now_ms + TOGGLE_TOAST_DURATION_MS));
+        shared.save_settings(false);
+    };
+
     let apply_debug_toggle = |shared: &Arc<AppSharedState>,
                               tray: &mut Option<Box<dyn iris_platform::TrayBackend>>,
                               transient_toast: &mut Option<(String, f64)>,
@@ -210,18 +244,20 @@ fn run_coordinator_loop(
         shared.save_settings(false);
     };
 
-    let apply_timed = |shared: &Arc<AppSharedState>,
-                       timed_run: &mut TimedOverlayRun,
-                       now_ms: f64| {
-        let (disabled, secs) = {
-            let s = shared.settings.read();
-            (s.overlay_disabled, s.timed_overlay_seconds)
+    let apply_timed =
+        |shared: &Arc<AppSharedState>, timed_run: &mut TimedOverlayRun, now_ms: f64| {
+            let (disabled, secs) = {
+                let s = shared.settings.read();
+                (s.overlay_disabled, s.timed_overlay_seconds)
+            };
+            let res = timed_run.press(disabled, secs, now_ms.round() as i64);
+            if matches!(
+                res,
+                TimedOverlayPress::Started | TimedOverlayPress::Restarted
+            ) {
+                tracing::debug!("Timed overlay peek activated for {}s", secs);
+            }
         };
-        let res = timed_run.press(disabled, secs, now_ms.round() as i64);
-        if matches!(res, TimedOverlayPress::Started | TimedOverlayPress::Restarted) {
-            tracing::debug!("Timed overlay peek activated for {}s", secs);
-        }
-    };
 
     let apply_interactive = |shared: &Arc<AppSharedState>| {
         let prev = shared.interactive_open.load(Ordering::Relaxed);
@@ -252,6 +288,36 @@ fn run_coordinator_loop(
             now_ms + TOGGLE_TOAST_DURATION_MS,
         ));
         shared.request_repaint();
+    };
+
+    let apply_step_radar_scale = |shared: &Arc<AppSharedState>,
+                                  tray: &mut Option<Box<dyn iris_platform::TrayBackend>>,
+                                  cached_breadcrumb_info: &mut Option<BreadcrumbOverlayInfo>,
+                                  transient_toast: &mut Option<(String, f64)>,
+                                  delta: i32,
+                                  wrap: bool,
+                                  now_ms: f64| {
+        let (new_km, visited_km) = {
+            let mut s = shared.settings.write();
+            let next = AppSettings::step_breadcrumb_radar_km(
+                s.breadcrumbs_radar_range_km,
+                s.breadcrumbs_visited_radius_km,
+                delta,
+                wrap,
+            );
+            s.breadcrumbs_radar_range_km = next;
+            (next, s.breadcrumbs_visited_radius_km)
+        };
+        *cached_breadcrumb_info = None;
+        if let Some(t) = tray.as_mut() {
+            t.set_radar_range_km(new_km);
+        }
+        let label = AppSettings::format_breadcrumb_radar_scale(new_km, visited_km);
+        *transient_toast = Some((
+            format!("Breadcrumb Radar: {}", label),
+            now_ms + TOGGLE_TOAST_DURATION_MS,
+        ));
+        shared.save_settings(false);
     };
 
     let apply_save_waypoint = |shared: &Arc<AppSharedState>,
@@ -321,6 +387,16 @@ fn run_coordinator_loop(
                     now_ms,
                 );
             }
+            IpcCommand::TogglePlayersOrgs => {
+                apply_players_orgs_toggle(
+                    &shared,
+                    &mut tray,
+                    &mut pipeline,
+                    &mut last_roster_len,
+                    &mut transient_toast,
+                    now_ms,
+                );
+            }
             IpcCommand::ToggleDebugOverlay => {
                 apply_debug_toggle(&shared, &mut tray, &mut transient_toast, now_ms);
             }
@@ -342,6 +418,33 @@ fn run_coordinator_loop(
                 &mut live_space_pos,
                 &mut cached_breadcrumb_info,
                 &mut transient_toast,
+                now_ms,
+            ),
+            IpcCommand::RadarZoomIn => apply_step_radar_scale(
+                &shared,
+                &mut tray,
+                &mut cached_breadcrumb_info,
+                &mut transient_toast,
+                -1,
+                false,
+                now_ms,
+            ),
+            IpcCommand::RadarZoomOut => apply_step_radar_scale(
+                &shared,
+                &mut tray,
+                &mut cached_breadcrumb_info,
+                &mut transient_toast,
+                1,
+                false,
+                now_ms,
+            ),
+            IpcCommand::CycleRadarScale => apply_step_radar_scale(
+                &shared,
+                &mut tray,
+                &mut cached_breadcrumb_info,
+                &mut transient_toast,
+                1,
+                true,
                 now_ms,
             ),
             IpcCommand::Quit => {
@@ -382,6 +485,16 @@ fn run_coordinator_loop(
                         now_ms,
                     );
                 }
+                IpcCommand::TogglePlayersOrgs => {
+                    apply_players_orgs_toggle(
+                        &shared,
+                        &mut tray,
+                        &mut pipeline,
+                        &mut last_roster_len,
+                        &mut transient_toast,
+                        now_ms,
+                    );
+                }
                 IpcCommand::ToggleDebugOverlay => {
                     apply_debug_toggle(&shared, &mut tray, &mut transient_toast, now_ms);
                 }
@@ -403,6 +516,33 @@ fn run_coordinator_loop(
                     &mut live_space_pos,
                     &mut cached_breadcrumb_info,
                     &mut transient_toast,
+                    now_ms,
+                ),
+                IpcCommand::RadarZoomIn => apply_step_radar_scale(
+                    &shared,
+                    &mut tray,
+                    &mut cached_breadcrumb_info,
+                    &mut transient_toast,
+                    -1,
+                    false,
+                    now_ms,
+                ),
+                IpcCommand::RadarZoomOut => apply_step_radar_scale(
+                    &shared,
+                    &mut tray,
+                    &mut cached_breadcrumb_info,
+                    &mut transient_toast,
+                    1,
+                    false,
+                    now_ms,
+                ),
+                IpcCommand::CycleRadarScale => apply_step_radar_scale(
+                    &shared,
+                    &mut tray,
+                    &mut cached_breadcrumb_info,
+                    &mut transient_toast,
+                    1,
+                    true,
                     now_ms,
                 ),
                 IpcCommand::Quit => {
@@ -434,6 +574,16 @@ fn run_coordinator_loop(
                         now_ms,
                     );
                 }
+                TrayAction::TogglePlayersOrgs => {
+                    apply_players_orgs_toggle(
+                        &shared,
+                        &mut tray,
+                        &mut pipeline,
+                        &mut last_roster_len,
+                        &mut transient_toast,
+                        now_ms,
+                    );
+                }
                 TrayAction::ToggleDebugOverlay => {
                     apply_debug_toggle(&shared, &mut tray, &mut transient_toast, now_ms);
                 }
@@ -445,6 +595,17 @@ fn run_coordinator_loop(
                         None,
                         None,
                         &mut center_toast,
+                        now_ms,
+                    );
+                }
+                TrayAction::CycleRadarScale => {
+                    apply_step_radar_scale(
+                        &shared,
+                        &mut tray,
+                        &mut cached_breadcrumb_info,
+                        &mut transient_toast,
+                        1,
+                        true,
                         now_ms,
                     );
                 }
@@ -484,6 +645,16 @@ fn run_coordinator_loop(
                         now_ms,
                     );
                 }
+                HotkeyAction::TogglePlayersOrgs => {
+                    apply_players_orgs_toggle(
+                        &shared,
+                        &mut tray,
+                        &mut pipeline,
+                        &mut last_roster_len,
+                        &mut transient_toast,
+                        now_ms,
+                    );
+                }
                 HotkeyAction::TimedOverlay => apply_timed(&shared, &mut timed_run, now_ms),
                 HotkeyAction::InteractiveOverlay => apply_interactive(&shared),
                 HotkeyAction::SaveWaypoint => apply_save_waypoint(
@@ -493,6 +664,24 @@ fn run_coordinator_loop(
                     None,
                     None,
                     &mut center_toast,
+                    now_ms,
+                ),
+                HotkeyAction::RadarZoomIn => apply_step_radar_scale(
+                    &shared,
+                    &mut tray,
+                    &mut cached_breadcrumb_info,
+                    &mut transient_toast,
+                    -1,
+                    false,
+                    now_ms,
+                ),
+                HotkeyAction::RadarZoomOut => apply_step_radar_scale(
+                    &shared,
+                    &mut tray,
+                    &mut cached_breadcrumb_info,
+                    &mut transient_toast,
+                    1,
+                    false,
                     now_ms,
                 ),
             }
@@ -506,12 +695,22 @@ fn run_coordinator_loop(
                     hotkeys.update_bindings(&s);
                     if let Some(t) = tray.as_mut() {
                         t.set_overlay_enabled(!s.overlay_disabled);
+                        t.set_players_orgs_enabled(s.players_orgs_enabled);
                         t.set_debug_enabled(s.debug_overlay_enabled);
+                        t.set_radar_range_km(s.breadcrumbs_radar_range_km);
+                    }
+                    if !s.players_orgs_enabled {
+                        pipeline.reset_nameplate_tracking();
+                        if last_roster_len != 0 {
+                            last_roster_len = 0;
+                            shared.live_roster.write().clear();
+                        }
                     }
                     cached_debug_info = None;
                     cached_breadcrumb_info = None;
                     if reset_capture {
                         capturer.reset();
+                        capturer_active = false;
                     }
                 }
                 CoordinatorCommand::ShowTestOverlay(part) => {
@@ -528,6 +727,16 @@ fn run_coordinator_loop(
                         &shared,
                         &mut tray,
                         &mut timed_run,
+                        &mut transient_toast,
+                        now_ms,
+                    );
+                }
+                CoordinatorCommand::TogglePlayersOrgs => {
+                    apply_players_orgs_toggle(
+                        &shared,
+                        &mut tray,
+                        &mut pipeline,
+                        &mut last_roster_len,
                         &mut transient_toast,
                         now_ms,
                     );
@@ -604,7 +813,8 @@ fn run_coordinator_loop(
             None
         };
         let track_position = settings.breadcrumbs_enabled || settings.waypoints_enabled;
-        let auto_ocr_enabled = (settings.breadcrumbs_enabled && settings.breadcrumbs_auto_displayinfo)
+        let auto_ocr_enabled = (settings.breadcrumbs_enabled
+            && settings.breadcrumbs_auto_displayinfo)
             || settings.waypoints_enabled;
 
         if track_position {
@@ -640,6 +850,7 @@ fn run_coordinator_loop(
                             transient_toast = Some((toast, now_ms + BREADCRUMB_TOAST_DURATION_MS));
                             cached_breadcrumb_info = breadcrumbs.build_overlay_info(
                                 radius_km,
+                                settings.effective_breadcrumb_radar_km(),
                                 settings.breadcrumbs_screen_cloud,
                                 live_space_pos,
                                 now_utc,
@@ -681,9 +892,9 @@ fn run_coordinator_loop(
                         }
                     } else if telem.root.is_some()
                         && live_pos_fix.body.is_some()
-                        && now_ms - last_body_seen_ms > 10_000.0
+                        && now_ms - last_body_seen_ms > 45_000.0
                     {
-                        // We left the planetary container into deep space
+                        // We left the planetary container into deep space (confirmed >45s without body line)
                         live_pos_fix.body = None;
                         active_body_key = None;
                         body_heading_tracker.reset();
@@ -696,6 +907,18 @@ fn run_coordinator_loop(
                         if let Some(accepted) =
                             display_info_stab.ingest(raw_coord, dual_confirmed, now_utc)
                         {
+                            // If we actually Quantum-Jumped (> 5,000 km in Root Pos), clear stale planetary lock
+                            if let Some(prev_root) = live_pos_fix.root {
+                                if prev_root.distance_km(&accepted) > 5_000.0
+                                    && live_pos_fix.body.is_some()
+                                    && now_ms - last_body_seen_ms > 3_000.0
+                                {
+                                    live_pos_fix.body = None;
+                                    active_body_key = None;
+                                    body_heading_tracker.reset();
+                                    local_body_stab.reset();
+                                }
+                            }
                             live_space_pos = Some(accepted);
                             live_pos_fix.root = Some(accepted);
                             if live_pos_fix.body.is_none() {
@@ -705,58 +928,6 @@ fn run_coordinator_loop(
                             }
                             root_heading_tracker.push(accepted, now_ms);
                             fix_updated = true;
-
-                            if settings.breadcrumbs_enabled {
-                                let radius_km = settings.breadcrumbs_visited_radius_km as f64;
-                                if settings.breadcrumbs_auto_displayinfo
-                                    && display_info_stab.should_auto_drop(
-                                        accepted,
-                                        settings.breadcrumbs_auto_interval_secs as i64,
-                                        now_utc,
-                                    )
-                                {
-                                    if let RecordOutcome::Recorded { point, proximity } =
-                                        breadcrumbs.record(accepted, radius_km, None, now_utc)
-                                    {
-                                        if settings.breadcrumbs_persist {
-                                            if let Err(err) =
-                                                breadcrumbs.save(&shared.paths.breadcrumbs_file())
-                                            {
-                                                tracing::warn!(
-                                                    "Failed saving breadcrumbs: {}",
-                                                    err
-                                                );
-                                            }
-                                        }
-                                        tracing::info!(
-                                            "Auto breadcrumb #{} from r_DisplayInfo ({:?}, nearest={:?} km)",
-                                            point.id,
-                                            proximity.zone,
-                                            proximity.nearest_distance_km
-                                        );
-                                        if proximity.zone != ProximityZone::Clear {
-                                            let toast =
-                                                BreadcrumbTrail::toast_text(&point, &proximity);
-                                            transient_toast = Some((
-                                                toast,
-                                                now_ms + BREADCRUMB_TOAST_DURATION_MS,
-                                            ));
-                                        }
-                                    }
-                                }
-                                cached_breadcrumb_info = breadcrumbs.build_overlay_info(
-                                    radius_km,
-                                    settings.breadcrumbs_screen_cloud,
-                                    live_space_pos,
-                                    now_utc,
-                                );
-                                last_breadcrumb_refresh_ms = now_ms;
-                                let headline = cached_breadcrumb_info
-                                    .as_ref()
-                                    .map(|i| i.headline.clone())
-                                    .unwrap_or_else(|| "Live r_DisplayInfo tracking".to_string());
-                                *shared.breadcrumb_summary.write() = (breadcrumbs.len(), headline);
-                            }
                         } else if settings.breadcrumbs_enabled && !fix_updated {
                             // First unconfirmed read — waiting for 2nd consistent frame
                             let status = "Acquiring r_DisplayInfo lock (1/2)…".to_string();
@@ -766,7 +937,87 @@ fn run_coordinator_loop(
                     } else if !fix_updated && now_ms - last_ocr_diag_log_ms >= 30_000.0 {
                         last_ocr_diag_log_ms = now_ms;
                         let sample = sanitize_ascii(&ocr_text.replace('\n', " | "), 120);
-                        tracing::info!("r_DisplayInfo OCR sample (no Root/Body Pos matched): {}", sample);
+                        tracing::info!(
+                            "r_DisplayInfo OCR sample (no Root/Body Pos matched): {}",
+                            sample
+                        );
+                    }
+
+                    // 3. Drop auto-breadcrumbs & refresh Breadcrumb Cloud in the active reference frame
+                    //    (zero-drift planetary local body frame on planets/moons; Root Pos in deep space)
+                    if fix_updated && settings.breadcrumbs_enabled {
+                        let radius_km = settings.breadcrumbs_visited_radius_km as f64;
+                        let interval_s = settings.breadcrumbs_auto_interval_secs as i64;
+                        if settings.breadcrumbs_auto_displayinfo {
+                            let drop_outcome =
+                                if let Some((ref disp, ref key, body_c)) = live_pos_fix.body {
+                                    if local_body_stab
+                                        .should_auto_drop(key, body_c, interval_s, now_utc)
+                                    {
+                                        let root_c = live_pos_fix.root.unwrap_or(body_c);
+                                        Some(breadcrumbs.record_with_local(
+                                            root_c,
+                                            Some((disp.clone(), body_c)),
+                                            radius_km,
+                                            None,
+                                            now_utc,
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                } else if let Some(root_c) = live_pos_fix.root {
+                                    if display_info_stab
+                                        .should_auto_drop(root_c, interval_s, now_utc)
+                                    {
+                                        Some(breadcrumbs.record_with_local(
+                                            root_c, None, radius_km, None, now_utc,
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                            if let Some(RecordOutcome::Recorded { point, proximity }) = drop_outcome
+                            {
+                                if settings.breadcrumbs_persist {
+                                    if let Err(err) =
+                                        breadcrumbs.save(&shared.paths.breadcrumbs_file())
+                                    {
+                                        tracing::warn!("Failed saving breadcrumbs: {}", err);
+                                    }
+                                }
+                                tracing::info!(
+                                    "Auto breadcrumb #{} from r_DisplayInfo ({:?}, zone={:?}, nearest={:?} km)",
+                                    point.id,
+                                    proximity.zone,
+                                    point.local_zone,
+                                    proximity.nearest_distance_km
+                                );
+                                if proximity.zone != ProximityZone::Clear {
+                                    let toast = BreadcrumbTrail::toast_text(&point, &proximity);
+                                    transient_toast =
+                                        Some((toast, now_ms + BREADCRUMB_TOAST_DURATION_MS));
+                                }
+                            }
+                        }
+
+                        let body_ref = live_pos_fix.body.as_ref().map(|(_, k, c)| (k.as_str(), *c));
+                        cached_breadcrumb_info = breadcrumbs.build_overlay_info_dual(
+                            radius_km,
+                            settings.effective_breadcrumb_radar_km(),
+                            settings.breadcrumbs_screen_cloud,
+                            live_space_pos,
+                            body_ref,
+                            now_utc,
+                        );
+                        last_breadcrumb_refresh_ms = now_ms;
+                        let headline = cached_breadcrumb_info
+                            .as_ref()
+                            .map(|i| i.headline.clone())
+                            .unwrap_or_else(|| "Live r_DisplayInfo tracking".to_string());
+                        *shared.breadcrumb_summary.write() = (breadcrumbs.len(), headline);
                     }
 
                     if fix_updated {
@@ -827,7 +1078,8 @@ fn run_coordinator_loop(
                 dbg.headline = format!("PREVIEW - SCANNING (IDLE)  #{:04}", step % 10_000);
             }
             if let Some(wp) = model.waypoint_info.as_mut() {
-                let elapsed_s = ((TEST_OVERLAY_DURATION_MS - (until_ms - now_ms)) / 1000.0).max(0.0);
+                let elapsed_s =
+                    ((TEST_OVERLAY_DURATION_MS - (until_ms - now_ms)) / 1000.0).max(0.0);
                 let dist_m = (10_000.0 - elapsed_s * 180.0).max(120.0);
                 let sweep_deg = -32.0 * (elapsed_s * 0.45).cos();
                 wp.distance_m = dist_m;
@@ -841,7 +1093,11 @@ fn run_coordinator_loop(
                 } else {
                     format!("LEFT {}°", abs_deg)
                 };
-                wp.subline = format!("{}  |  UP +420 m  |  ETA 0:{:02}", wp.steering_text, ((dist_m / 180.0).round() as u64).min(59));
+                wp.subline = format!(
+                    "{}  |  UP +420 m  |  ETA 0:{:02}",
+                    wp.steering_text,
+                    ((dist_m / 180.0).round() as u64).min(59)
+                );
             }
 
             if let Some(o) = overlay.as_mut() {
@@ -902,14 +1158,21 @@ fn run_coordinator_loop(
 
         let show_borderless_note = now_ms < borderless_until_ms && game.focused && !game.minimized;
         let effective_overlay_active = !settings.overlay_disabled || timed_run.is_active;
-        let show_toggle_toast =
-            (transient_toast.is_some() || center_toast.is_some()) && game.focused && !game.minimized;
-        let show_debug_hud =
-            settings.debug_overlay_enabled && effective_overlay_active && game.focused && !game.minimized;
+        let show_toggle_toast = (transient_toast.is_some() || center_toast.is_some())
+            && game.focused
+            && !game.minimized;
+        let show_debug_hud = settings.debug_overlay_enabled
+            && effective_overlay_active
+            && game.focused
+            && !game.minimized;
 
         if win_state != GameWindowState::Ready && !show_borderless_note && !show_debug_hud {
             if !game.present {
                 pipeline.reset_tracking();
+                if capturer_active {
+                    capturer.reset();
+                    capturer_active = false;
+                }
                 capture_fps = 0.0;
                 last_blank_picture = false;
             }
@@ -996,78 +1259,115 @@ fn run_coordinator_loop(
             ..Default::default()
         };
 
+        let need_nameplate_scan = settings.players_orgs_enabled;
+        let need_mining_scan = !settings.mining_disabled;
+        let need_frame_capture = need_nameplate_scan || need_mining_scan || auto_ocr_enabled;
+        let ocr_interval_ms = if active_waypoint.is_some() {
+            150.0
+        } else {
+            1_500.0
+        };
+        let capture_due_this_tick = need_nameplate_scan
+            || need_mining_scan
+            || (auto_ocr_enabled && now_ms - last_display_info_submit_ms >= ocr_interval_ms);
+
         if win_state == GameWindowState::Ready && effective_overlay_active {
-            match capturer.capture_frame(&game, &mut settings, now_ms) {
-                Ok((maybe_frame, mutated_settings)) => {
-                    if mutated_settings {
-                        shared.settings.write().linux_portal_restore_token =
-                            settings.linux_portal_restore_token.clone();
-                        shared.save_settings(false);
-                    }
-                    if let Some(frame) = maybe_frame {
-                        frames_captured = frames_captured.wrapping_add(1);
-                        captures_in_window += 1;
-                        last_capture_ms = now_ms;
-                        let snap = {
-                            let social_guard = shared.social.read();
-                            pipeline.process_frame(&frame, &settings, &social_guard)
-                        };
-                        let ocr_interval_ms = if active_waypoint.is_some() {
-                            450.0
-                        } else {
-                            1_500.0
-                        };
-                        if auto_ocr_enabled
-                            && !snap.blank_picture
-                            && now_ms - last_display_info_submit_ms >= ocr_interval_ms
-                        {
-                            last_display_info_submit_ms = now_ms;
-                            let fw = frame.bgr.width;
-                            let fh = frame.bgr.height;
-                            if fw >= 320 && fh >= 200 {
-                                // Top 15% x right 36% isolates CamDir + Zone: ... + Zone: solarsystem + Zone: Root Pos:
-                                // above the comms/party icon while staying under WinRT's 4096px OCR limit.
-                                let cw = ((fw as f64) * 0.36).round() as usize;
-                                let ch = ((fh as f64) * 0.15).round() as usize;
-                                let x0 = fw.saturating_sub(cw);
-                                let mut crop = Vec::with_capacity(cw * ch * 3);
-                                for y in 0..ch {
-                                    let row_start = (y * fw + x0) * 3;
-                                    let row_end = row_start + cw * 3;
-                                    if row_end <= frame.bgr.data.len() {
-                                        crop.extend_from_slice(&frame.bgr.data[row_start..row_end]);
+            if !need_frame_capture {
+                if capturer_active {
+                    capturer.reset();
+                    capturer_active = false;
+                }
+                {
+                    let social_guard = shared.social.read();
+                    pipeline.drain_lookups(&social_guard);
+                }
+                if last_roster_len != 0 {
+                    last_roster_len = 0;
+                    shared.live_roster.write().clear();
+                }
+                last_stats = PipelineStats::default();
+                last_blank_picture = false;
+                capture_fps = 0.0;
+            } else if capture_due_this_tick {
+                capturer_active = true;
+                match capturer.capture_frame(&game, &mut settings, now_ms) {
+                    Ok((maybe_frame, mutated_settings)) => {
+                        if mutated_settings {
+                            shared.settings.write().linux_portal_restore_token =
+                                settings.linux_portal_restore_token.clone();
+                            shared.save_settings(false);
+                        }
+                        if let Some(frame) = maybe_frame {
+                            frames_captured = frames_captured.wrapping_add(1);
+                            captures_in_window += 1;
+                            last_capture_ms = now_ms;
+                            let snap = {
+                                let social_guard = shared.social.read();
+                                pipeline.process_frame(&frame, &settings, &social_guard)
+                            };
+                            if auto_ocr_enabled
+                                && !snap.blank_picture
+                                && now_ms - last_display_info_submit_ms >= ocr_interval_ms
+                            {
+                                last_display_info_submit_ms = now_ms;
+                                let fw = frame.bgr.width;
+                                let fh = frame.bgr.height;
+                                if fw >= 320 && fh >= 200 {
+                                    // Top 20% x right 38% captures CamDir + ship/station + planetary Zone +
+                                    // solarsystem + Root Pos while keeping full 3x OCR upscale on 1440p.
+                                    let cw = ((fw as f64) * 0.38).round() as usize;
+                                    let ch = ((fh as f64) * 0.20).round() as usize;
+                                    let x0 = fw.saturating_sub(cw);
+                                    let mut crop = Vec::with_capacity(cw * ch * 3);
+                                    for y in 0..ch {
+                                        let row_start = (y * fw + x0) * 3;
+                                        let row_end = row_start + cw * 3;
+                                        if row_end <= frame.bgr.data.len() {
+                                            crop.extend_from_slice(
+                                                &frame.bgr.data[row_start..row_end],
+                                            );
+                                        }
+                                    }
+                                    if crop.len() == cw * ch * 3 {
+                                        display_info_ocr.submit_top_right_bgr(crop, cw, ch);
                                     }
                                 }
-                                if crop.len() == cw * ch * 3 {
-                                    display_info_ocr.submit_top_right_bgr(crop, cw, ch);
+                            }
+                            capturer.recycle_frame(frame);
+                            if !snap.roster.is_empty() || last_roster_len != 0 {
+                                last_roster_len = snap.roster.len();
+                                *shared.live_roster.write() = snap.roster;
+                            }
+                            last_stats = snap.stats;
+                            last_blank_picture = snap.blank_picture;
+                            model_to_draw = snap.model;
+                        } else {
+                            capture_timeouts = capture_timeouts.wrapping_add(1);
+                            if let Some(prev) = &last_drawn_model {
+                                // Frame timeout / cursor-only update: keep still-enabled HUD markers steady
+                                if settings.players_orgs_enabled {
+                                    model_to_draw.brackets = prev.brackets.clone();
+                                    model_to_draw.panel_entries = prev.panel_entries.clone();
                                 }
+                                if !settings.mining_disabled {
+                                    model_to_draw.mining_labels = prev.mining_labels.clone();
+                                }
+                                model_to_draw.note = prev.note.clone();
                             }
                         }
-                        capturer.recycle_frame(frame);
-                        if !snap.roster.is_empty() || last_roster_len != 0 {
-                            last_roster_len = snap.roster.len();
-                            *shared.live_roster.write() = snap.roster;
-                        }
-                        last_stats = snap.stats;
-                        last_blank_picture = snap.blank_picture;
-                        model_to_draw = snap.model;
-                    } else {
-                        capture_timeouts = capture_timeouts.wrapping_add(1);
-                        if let Some(prev) = &last_drawn_model {
-                            // Frame timeout / cursor-only update: keep existing HUD markers steady
-                            model_to_draw.brackets = prev.brackets.clone();
-                            model_to_draw.panel_entries = prev.panel_entries.clone();
-                            model_to_draw.mining_labels = prev.mining_labels.clone();
-                            model_to_draw.note = prev.note.clone();
-                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("Frame capture transient error: {}", err);
+                        capture_errors = capture_errors.wrapping_add(1);
+                        last_capture_error = Some((sanitize_ascii(&err.to_string(), 42), now_ms));
+                        capturer.reset();
+                        capturer_active = false;
                     }
                 }
-                Err(err) => {
-                    tracing::debug!("Frame capture transient error: {}", err);
-                    capture_errors = capture_errors.wrapping_add(1);
-                    last_capture_error = Some((sanitize_ascii(&err.to_string(), 42), now_ms));
-                    capturer.reset();
-                }
+            } else {
+                // Only low-rate r_DisplayInfo OCR needs frames; skip GPU capture between OCR intervals
+                let social_guard = shared.social.read();
+                pipeline.drain_lookups(&social_guard);
             }
         }
 
@@ -1088,6 +1388,8 @@ fn run_coordinator_loop(
 
         let active_status = compute_active_status_text(
             win_state,
+            &settings,
+            need_frame_capture,
             &last_capture_error,
             last_capture_ms,
             last_blank_picture,
@@ -1107,6 +1409,7 @@ fn run_coordinator_loop(
                 cached_debug_info = Some(build_debug_overlay_info(
                     win_state,
                     &settings,
+                    need_frame_capture,
                     target_bounds,
                     loop_hz,
                     capture_fps,
@@ -1128,13 +1431,17 @@ fn run_coordinator_loop(
         }
 
         if effective_overlay_active && settings.breadcrumbs_enabled {
-            if cached_breadcrumb_info.is_none() || now_ms - last_breadcrumb_refresh_ms >= 5_000.0 {
+            if cached_breadcrumb_info.is_none() || now_ms - last_breadcrumb_refresh_ms >= 2_500.0 {
                 last_breadcrumb_refresh_ms = now_ms;
+                let body_ref = live_pos_fix.body.as_ref().map(|(_, k, c)| (k.as_str(), *c));
+                let radar_range_km = settings.effective_breadcrumb_radar_km();
                 cached_breadcrumb_info = breadcrumbs
-                    .build_overlay_info(
+                    .build_overlay_info_dual(
                         settings.breadcrumbs_visited_radius_km as f64,
+                        radar_range_km,
                         settings.breadcrumbs_screen_cloud,
                         live_space_pos,
+                        body_ref,
                         Utc::now(),
                     )
                     .or_else(|| {
@@ -1150,6 +1457,7 @@ fn run_coordinator_loop(
                                 settings.breadcrumbs_visited_radius_km
                             ),
                             visited_radius_km: settings.breadcrumbs_visited_radius_km as f64,
+                            radar_range_km,
                             heading_rad: None,
                             show_screen_cloud: false,
                             points: Vec::new(),
@@ -1159,20 +1467,36 @@ fn run_coordinator_loop(
             }
             let mut bc_model = cached_breadcrumb_info.clone();
             if let (Some(bc), Some(wp)) = (bc_model.as_mut(), active_waypoint.as_ref()) {
-                let delta_opt = if let (
-                    Some((_, cur_key, cur_local)),
-                    Some(wp_zone),
-                    Some(wp_local),
-                ) = (&live_pos_fix.body, wp.local_zone.as_deref(), wp.local_coord)
-                {
-                    if zones_match(cur_key, wp_zone) {
-                        Some(((wp_local.x - cur_local.x) / 1000.0, (wp_local.y - cur_local.y) / 1000.0))
+                let delta_opt =
+                    if let (Some((_, cur_key, cur_local)), Some(wp_zone), Some(wp_local)) =
+                        (&live_pos_fix.body, wp.local_zone.as_deref(), wp.local_coord)
+                    {
+                        if zones_match(cur_key, wp_zone) {
+                            let d_m = [
+                                wp_local.x - cur_local.x,
+                                wp_local.y - cur_local.y,
+                                wp_local.z - cur_local.z,
+                            ];
+                            if let Some((east, north, _)) = planetary_enu_basis(*cur_local) {
+                                let de = (d_m[0] * east[0] + d_m[1] * east[1] + d_m[2] * east[2])
+                                    / 1000.0;
+                                let dn =
+                                    (d_m[0] * north[0] + d_m[1] * north[1] + d_m[2] * north[2])
+                                        / 1000.0;
+                                Some((de, dn))
+                            } else {
+                                Some((d_m[0] / 1000.0, d_m[1] / 1000.0))
+                            }
+                        } else {
+                            live_pos_fix
+                                .root
+                                .map(|r| ((wp.coord.x - r.x) / 1000.0, (wp.coord.y - r.y) / 1000.0))
+                        }
                     } else {
-                        live_pos_fix.root.map(|r| ((wp.coord.x - r.x) / 1000.0, (wp.coord.y - r.y) / 1000.0))
-                    }
-                } else {
-                    live_pos_fix.root.map(|r| ((wp.coord.x - r.x) / 1000.0, (wp.coord.y - r.y) / 1000.0))
-                };
+                        live_pos_fix
+                            .root
+                            .map(|r| ((wp.coord.x - r.x) / 1000.0, (wp.coord.y - r.y) / 1000.0))
+                    };
                 if let Some((dx_km, dy_km)) = delta_opt {
                     bc.active_waypoint = Some(BreadcrumbWaypointPin {
                         name: wp.name.clone(),
@@ -1252,11 +1576,22 @@ fn run_coordinator_loop(
             );
         }
 
-        // 9. Frame rate pacing
-        let target_fps = if settings.nameplate_tracking_fps > AppSettings::TRACKING_FPS_HIGHEST {
-            120.0
+        // 9. Frame rate pacing (drop capture & loop cadence aggressively when Players & Orgs is off)
+        let target_fps = if settings.players_orgs_enabled {
+            if settings.nameplate_tracking_fps > AppSettings::TRACKING_FPS_HIGHEST {
+                120.0
+            } else {
+                settings
+                    .nameplate_tracking_fps
+                    .max(AppSettings::TRACKING_FPS_MIN) as f64
+            }
+        } else if !settings.mining_disabled {
+            // Mining HUD scanner runs at lock_hz (12 Hz); 15 Hz keeps mining & 150 ms waypoint OCR responsive
+            15.0
+        } else if auto_ocr_enabled && active_waypoint.is_some() {
+            20.0
         } else {
-            settings.nameplate_tracking_fps.max(AppSettings::TRACKING_FPS_MIN) as f64
+            10.0
         };
         let frame_budget = Duration::from_secs_f64(1.0 / target_fps);
         let elapsed = tick_start.elapsed();
@@ -1304,8 +1639,11 @@ fn capture_backend_short_name(method: CaptureMethod) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_active_status_text(
     win_state: GameWindowState,
+    settings: &AppSettings,
+    need_frame_capture: bool,
     last_capture_error: &Option<(String, f64)>,
     last_capture_ms: f64,
     last_blank_picture: bool,
@@ -1314,6 +1652,21 @@ fn compute_active_status_text(
 ) -> String {
     if win_state == GameWindowState::NotBorderless {
         return "Not Borderless (Windowed/Fullscreen)".to_string();
+    }
+    if !settings.players_orgs_enabled {
+        if !need_frame_capture {
+            return "Players & Orgs Off (CPU Saver)".to_string();
+        }
+        if !model_to_draw.mining_labels.is_empty() {
+            return format!(
+                "Players/Orgs Off • Mining ({} active)",
+                model_to_draw.mining_labels.len()
+            );
+        }
+        if !settings.mining_disabled {
+            return "Players/Orgs Off (Mining Active)".to_string();
+        }
+        return "Players/Orgs Off (Position OCR Only)".to_string();
     }
     if let Some((_, err_ms)) = last_capture_error {
         if now_ms - *err_ms < 3_000.0 && last_capture_ms < *err_ms {
@@ -1338,6 +1691,7 @@ fn compute_active_status_text(
 fn build_debug_overlay_info(
     win_state: GameWindowState,
     settings: &AppSettings,
+    need_frame_capture: bool,
     target_bounds: IntRect,
     loop_hz: f64,
     capture_fps: f64,
@@ -1360,6 +1714,31 @@ fn build_debug_overlay_info(
             DebugStatusLevel::Warning,
             "WARN - NOT BORDERLESS".to_string(),
         )
+    } else if !settings.players_orgs_enabled {
+        if !need_frame_capture {
+            (
+                DebugStatusLevel::Idle,
+                "CPU SAVER - PLAYERS/ORGS OFF".to_string(),
+            )
+        } else if !model_to_draw.mining_labels.is_empty() {
+            (
+                DebugStatusLevel::Active,
+                format!(
+                    "MINING ONLY - LOCKED ({} ACTIVE)",
+                    model_to_draw.mining_labels.len()
+                ),
+            )
+        } else if !settings.mining_disabled {
+            (
+                DebugStatusLevel::Active,
+                "CPU SAVER - MINING ONLY".to_string(),
+            )
+        } else {
+            (
+                DebugStatusLevel::Idle,
+                "CPU SAVER - NAV OCR ONLY".to_string(),
+            )
+        }
     } else if recent_err.is_some() {
         (DebugStatusLevel::Error, "ERR - CAPTURE FAILED".to_string())
     } else if last_blank_picture {
@@ -1392,23 +1771,30 @@ fn build_debug_overlay_info(
 
     let line1 = format!(
         "Loop: {:.0} Hz  |  Cap: {:.0} FPS ({} {}x{})  |  Scan: {:.1} ms",
-        loop_hz,
-        capture_fps,
-        backend,
-        target_bounds.width,
-        target_bounds.height,
-        stats.process_ms
+        loop_hz, capture_fps, backend, target_bounds.width, target_bounds.height, stats.process_ms
     );
 
-    let line2 = format!(
-        "Plates: {} box, {} pair, {} OCR  |  Tracks: {} conf, {} tent  |  RSI: {}",
-        stats.candidate_boxes,
-        stats.candidate_pairs,
-        stats.ocr_reads,
-        stats.confirmed_tracks,
-        stats.tentative_tracks,
-        stats.in_flight_lookups
-    );
+    let line2 = if settings.players_orgs_enabled {
+        format!(
+            "Plates: {} box, {} pair, {} OCR  |  Tracks: {} conf, {} tent  |  RSI: {}",
+            stats.candidate_boxes,
+            stats.candidate_pairs,
+            stats.ocr_reads,
+            stats.confirmed_tracks,
+            stats.tentative_tracks,
+            stats.in_flight_lookups
+        )
+    } else {
+        format!(
+            "Players/Orgs: OFF (CPU Saver)  |  Capture: {}  |  RSI: {}",
+            if need_frame_capture {
+                "Throttled"
+            } else {
+                "Paused"
+            },
+            stats.in_flight_lookups
+        )
+    };
 
     let mining_txt = if settings.mining_disabled {
         "Off".to_string()
@@ -1453,7 +1839,10 @@ fn build_debug_overlay_info(
     };
 
     let (candidate_boxes, scan_boundary) =
-        if settings.debug_show_candidates && win_state == GameWindowState::Ready {
+        if settings.players_orgs_enabled
+            && settings.debug_show_candidates
+            && win_state == GameWindowState::Ready
+        {
             let boundary = TrackingBoundary::from_settings(settings);
             (
                 stats.debug_boxes.clone(),
@@ -1498,10 +1887,13 @@ fn publish_diagnostics(
         "Searching".to_string()
     };
 
-    let last_ocr_sample = stats.last_read_sample.as_ref().map(|(txt, verdict, seen_ms)| {
-        let age_s = ((now_ms - *seen_ms) / 1000.0).max(0.0);
-        format!("\"{}\" ({}, {:.0}s ago)", txt, verdict, age_s)
-    });
+    let last_ocr_sample = stats
+        .last_read_sample
+        .as_ref()
+        .map(|(txt, verdict, seen_ms)| {
+            let age_s = ((now_ms - *seen_ms) / 1000.0).max(0.0);
+            format!("\"{}\" ({}, {:.0}s ago)", txt, verdict, age_s)
+        });
 
     let snap = LiveDiagnosticsSnapshot {
         coordinator_ticks,

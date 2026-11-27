@@ -15,9 +15,12 @@ use std::time::Duration;
 #[derive(Clone, Default)]
 struct ActiveBindings {
     toggle: Option<HotkeyChord>,
+    toggle_players_orgs: Option<HotkeyChord>,
     timed: Option<HotkeyChord>,
     interactive: Option<HotkeyChord>,
     save_waypoint: Option<HotkeyChord>,
+    radar_zoom_in: Option<HotkeyChord>,
+    radar_zoom_out: Option<HotkeyChord>,
 }
 
 pub struct LinuxHotkeyListener {
@@ -54,9 +57,12 @@ impl LinuxHotkeyListener {
     fn parse_bindings(settings: &AppSettings) -> ActiveBindings {
         ActiveBindings {
             toggle: HotkeyText::parse(&settings.hotkey_toggle_overlay).ok(),
+            toggle_players_orgs: HotkeyText::parse(&settings.hotkey_toggle_players_orgs).ok(),
             timed: HotkeyText::parse(&settings.hotkey_timed_overlay).ok(),
             interactive: HotkeyText::parse(&settings.hotkey_interactive_overlay).ok(),
             save_waypoint: HotkeyText::parse(&settings.hotkey_save_waypoint).ok(),
+            radar_zoom_in: HotkeyText::parse(&settings.hotkey_radar_zoom_in).ok(),
+            radar_zoom_out: HotkeyText::parse(&settings.hotkey_radar_zoom_out).ok(),
         }
     }
 
@@ -143,11 +149,18 @@ impl LinuxHotkeyListener {
                                                 let guard = bindings.read();
                                                 if matches(&guard.toggle) {
                                                     let _ = tx.send(HotkeyAction::ToggleOverlay);
+                                                } else if matches(&guard.toggle_players_orgs) {
+                                                    let _ =
+                                                        tx.send(HotkeyAction::TogglePlayersOrgs);
                                                 } else if matches(&guard.interactive) {
                                                     let _ =
                                                         tx.send(HotkeyAction::InteractiveOverlay);
                                                 } else if matches(&guard.save_waypoint) {
                                                     let _ = tx.send(HotkeyAction::SaveWaypoint);
+                                                } else if matches(&guard.radar_zoom_in) {
+                                                    let _ = tx.send(HotkeyAction::RadarZoomIn);
+                                                } else if matches(&guard.radar_zoom_out) {
+                                                    let _ = tx.send(HotkeyAction::RadarZoomOut);
                                                 } else if matches(&guard.timed) {
                                                     let _ = tx.send(HotkeyAction::TimedOverlay);
                                                 }
@@ -193,6 +206,13 @@ impl LinuxHotkeyListener {
                             .preferred_trigger(Some(
                                 to_xdg_trigger(&settings.hotkey_toggle_overlay).as_str(),
                             )),
+                        NewShortcut::new(
+                            "toggle-players-orgs",
+                            "Toggle Players & Orgs Overlay",
+                        )
+                        .preferred_trigger(Some(
+                            to_xdg_trigger(&settings.hotkey_toggle_players_orgs).as_str(),
+                        )),
                         NewShortcut::new("interactive-overlay", "Open SC Interactive Dossier")
                             .preferred_trigger(Some(
                                 to_xdg_trigger(&settings.hotkey_interactive_overlay).as_str(),
@@ -200,6 +220,14 @@ impl LinuxHotkeyListener {
                         NewShortcut::new("save-waypoint", "Save Current POI Waypoint")
                             .preferred_trigger(Some(
                                 to_xdg_trigger(&settings.hotkey_save_waypoint).as_str(),
+                            )),
+                        NewShortcut::new("radar-zoom-in", "Breadcrumb Radar Zoom In")
+                            .preferred_trigger(Some(
+                                to_xdg_trigger(&settings.hotkey_radar_zoom_in).as_str(),
+                            )),
+                        NewShortcut::new("radar-zoom-out", "Breadcrumb Radar Zoom Out")
+                            .preferred_trigger(Some(
+                                to_xdg_trigger(&settings.hotkey_radar_zoom_out).as_str(),
                             )),
                     ];
                     // Only bind timed-overlay in XDG portal if it uses a modifier (so bare `Tab` isn't eaten!)
@@ -223,6 +251,9 @@ impl LinuxHotkeyListener {
                                 "toggle-overlay" => {
                                     let _ = tx.send(HotkeyAction::ToggleOverlay);
                                 }
+                                "toggle-players-orgs" => {
+                                    let _ = tx.send(HotkeyAction::TogglePlayersOrgs);
+                                }
                                 "timed-overlay" => {
                                     let _ = tx.send(HotkeyAction::TimedOverlay);
                                 }
@@ -231,6 +262,12 @@ impl LinuxHotkeyListener {
                                 }
                                 "save-waypoint" => {
                                     let _ = tx.send(HotkeyAction::SaveWaypoint);
+                                }
+                                "radar-zoom-in" => {
+                                    let _ = tx.send(HotkeyAction::RadarZoomIn);
+                                }
+                                "radar-zoom-out" => {
+                                    let _ = tx.send(HotkeyAction::RadarZoomOut);
                                 }
                                 _ => {}
                             }

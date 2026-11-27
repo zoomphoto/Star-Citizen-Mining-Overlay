@@ -1112,6 +1112,9 @@ impl TestOverlayBuilder {
                 let radius = settings
                     .map(|s| s.breadcrumbs_visited_radius_km as f64)
                     .unwrap_or(5.0);
+                let radar_range_km = settings
+                    .map(|s| s.effective_breadcrumb_radar_km())
+                    .unwrap_or_else(|| (radius * 3.0).max(10.0));
                 let show_cloud = settings.map(|s| s.breadcrumbs_screen_cloud).unwrap_or(true);
                 OverlayModel {
                     window_width: screen_width as i32,
@@ -1130,6 +1133,7 @@ impl TestOverlayBuilder {
                         headline: "VISITED CLOUD - 2.1 km from #3 (14m ago)".to_string(),
                         subline: format!("6 pts  |  Cloud {:.0} km  |  dZ +0.2 km", radius),
                         visited_radius_km: radius,
+                        radar_range_km,
                         heading_rad: Some(0.65),
                         show_screen_cloud: show_cloud,
                         active_waypoint: Some(BreadcrumbWaypointPin {

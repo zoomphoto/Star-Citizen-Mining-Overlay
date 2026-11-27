@@ -24,6 +24,7 @@ pub enum CoordinatorCommand {
     ReloadExclusions,
     LookupPlayer(String),
     ToggleOverlay,
+    TogglePlayersOrgs,
     ToggleDebugOverlay,
     TimedOverlay,
     OpenInteractive,

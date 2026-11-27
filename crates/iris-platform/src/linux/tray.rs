@@ -2,12 +2,14 @@ use crate::{TrayAction, TrayBackend, TRAY_OFF_ICO, TRAY_ON_ICO};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::{StandardItem, SubMenu};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 struct ScOverlayKsniTray {
     overlay_enabled: Arc<AtomicBool>,
+    players_orgs_enabled: Arc<AtomicBool>,
     debug_enabled: Arc<AtomicBool>,
+    radar_range_km: Arc<AtomicI32>,
     tx: Sender<TrayAction>,
     icon_on: Vec<ksni::Icon>,
     icon_off: Vec<ksni::Icon>,
@@ -45,11 +47,23 @@ impl ksni::Tray for ScOverlayKsniTray {
         } else {
             "Enable Overlay"
         };
+        let players_on = self.players_orgs_enabled.load(Ordering::Relaxed);
+        let players_label = if players_on {
+            "Disable Players & Orgs"
+        } else {
+            "Enable Players & Orgs"
+        };
         let debug_on = self.debug_enabled.load(Ordering::Relaxed);
         let debug_label = if debug_on {
             "Hide Debug HUD"
         } else {
             "Show Debug HUD"
+        };
+        let radar_km = self.radar_range_km.load(Ordering::Relaxed);
+        let radar_label = if radar_km <= 0 {
+            "Breadcrumb Scale: Auto (Next)".to_string()
+        } else {
+            format!("Breadcrumb Scale: {} km (Next)", radar_km)
         };
 
         vec![
@@ -70,6 +84,14 @@ impl ksni::Tray for ScOverlayKsniTray {
             }
             .into(),
             StandardItem {
+                label: players_label.to_string(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.tx.send(TrayAction::TogglePlayersOrgs);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
                 label: debug_label.to_string(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.tx.send(TrayAction::ToggleDebugOverlay);
@@ -81,6 +103,14 @@ impl ksni::Tray for ScOverlayKsniTray {
                 label: "Save POI at Current Position".to_string(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.tx.send(TrayAction::SaveWaypoint);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: radar_label,
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.tx.send(TrayAction::CycleRadarScale);
                 }),
                 ..Default::default()
             }
@@ -125,19 +155,30 @@ impl ksni::Tray for ScOverlayKsniTray {
 
 pub struct LinuxTrayBackend {
     overlay_enabled: Arc<AtomicBool>,
+    players_orgs_enabled: Arc<AtomicBool>,
     debug_enabled: Arc<AtomicBool>,
+    radar_range_km: Arc<AtomicI32>,
     handle: Handle<ScOverlayKsniTray>,
     rx: Receiver<TrayAction>,
 }
 
 impl LinuxTrayBackend {
-    pub fn new(overlay_enabled: bool, debug_enabled: bool) -> anyhow::Result<Self> {
+    pub fn new(
+        overlay_enabled: bool,
+        players_orgs_enabled: bool,
+        debug_enabled: bool,
+        radar_range_km: i32,
+    ) -> anyhow::Result<Self> {
         let flag = Arc::new(AtomicBool::new(overlay_enabled));
+        let players_flag = Arc::new(AtomicBool::new(players_orgs_enabled));
         let debug_flag = Arc::new(AtomicBool::new(debug_enabled));
+        let radar_km = Arc::new(AtomicI32::new(radar_range_km));
         let (tx, rx) = unbounded();
         let tray = ScOverlayKsniTray {
             overlay_enabled: Arc::clone(&flag),
+            players_orgs_enabled: Arc::clone(&players_flag),
             debug_enabled: Arc::clone(&debug_flag),
+            radar_range_km: Arc::clone(&radar_km),
             tx,
             icon_on: decode_ico_to_ksni(TRAY_ON_ICO),
             icon_off: decode_ico_to_ksni(TRAY_OFF_ICO),
@@ -150,7 +191,9 @@ impl LinuxTrayBackend {
         let _ = std::marker::PhantomData::<SubMenu<ScOverlayKsniTray>>;
         Ok(Self {
             overlay_enabled: flag,
+            players_orgs_enabled: players_flag,
             debug_enabled: debug_flag,
+            radar_range_km: radar_km,
             handle,
             rx,
         })
@@ -163,8 +206,18 @@ impl TrayBackend for LinuxTrayBackend {
         let _ = self.handle.update(|_| {});
     }
 
+    fn set_players_orgs_enabled(&mut self, enabled: bool) {
+        self.players_orgs_enabled.store(enabled, Ordering::Relaxed);
+        let _ = self.handle.update(|_| {});
+    }
+
     fn set_debug_enabled(&mut self, enabled: bool) {
         self.debug_enabled.store(enabled, Ordering::Relaxed);
+        let _ = self.handle.update(|_| {});
+    }
+
+    fn set_radar_range_km(&mut self, range_km: i32) {
+        self.radar_range_km.store(range_km, Ordering::Relaxed);
         let _ = self.handle.update(|_| {});
     }
 

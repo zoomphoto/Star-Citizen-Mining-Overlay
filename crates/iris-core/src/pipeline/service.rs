@@ -265,12 +265,23 @@ impl LiveDetectionPipeline {
         self.exclusions = ExclusionList::load_or_embedded(&self.paths.exclusions_file());
     }
 
-    pub fn reset_tracking(&mut self) {
+    pub fn reset_nameplate_tracking(&mut self) {
         self.tracker.markers.clear();
+        self.tracker.recently_ended.clear();
         self.white_dupes.clear();
+        self.last_read_sample = None;
+        self.aberration_note_until_ms = f64::NEG_INFINITY;
+    }
+
+    pub fn reset_tracking(&mut self) {
+        self.reset_nameplate_tracking();
         self.mining_lock = None;
         self.blank_watch.reset();
-        self.last_read_sample = None;
+    }
+
+    /// Drains completed async RSI lookups when frame processing is idle.
+    pub fn drain_lookups(&mut self, social: &SocialConfig) {
+        self.drain_lookup_results(social);
     }
 
     /// Requests a profile/orgs lookup for an arbitrary handle (e.g. from Interactive Overlay search).
@@ -315,23 +326,39 @@ impl LiveDetectionPipeline {
         }
 
         if self.blank_watch.active {
+            if !settings.players_orgs_enabled
+                && (!self.tracker.markers.is_empty()
+                    || !self.tracker.recently_ended.is_empty()
+                    || self.last_read_sample.is_some())
+            {
+                self.reset_nameplate_tracking();
+            }
             let mut model = OverlayModel {
                 window_width: win_w,
                 window_height: win_h,
                 note: Some(BlankPictureWatch::NOTE_TEXT.to_string()),
                 ..Default::default()
             };
-            model.panel_entries = self.build_panel_entries(now_ms, social);
-            let confirmed_tracks = self
-                .tracker
-                .markers
-                .iter()
-                .filter(|m| m.status == PlateStatus::Confirmed)
-                .count();
-            let tentative_tracks = self.tracker.markers.len().saturating_sub(confirmed_tracks);
+            let (roster, confirmed_tracks, tentative_tracks) = if settings.players_orgs_enabled {
+                model.panel_entries = self.build_panel_entries(now_ms, social);
+                let confirmed = self
+                    .tracker
+                    .markers
+                    .iter()
+                    .filter(|m| m.status == PlateStatus::Confirmed)
+                    .count();
+                let tentative = self.tracker.markers.len().saturating_sub(confirmed);
+                (
+                    InteractiveRoster::build(&self.tracker, now_ms),
+                    confirmed,
+                    tentative,
+                )
+            } else {
+                (Vec::new(), 0, 0)
+            };
             return PipelineSnapshot {
                 model,
-                roster: InteractiveRoster::build(&self.tracker, now_ms),
+                roster,
                 blank_picture: true,
                 aberration: Some(self.aberration_state),
                 stats: PipelineStats {
@@ -346,53 +373,109 @@ impl LiveDetectionPipeline {
             };
         }
 
-        // 3. Configure detector scan region from TrackingBoundary
-        let boundary = TrackingBoundary::from_settings(settings);
-        self.detector.settings_mut().region_left = boundary.left;
-        self.detector.settings_mut().region_top = boundary.top;
-        self.detector.settings_mut().region_right = boundary.right;
-        self.detector.settings_mut().region_bottom = boundary.bottom;
+        // 3-8. Nameplate detection, tracking, RSI lookup queuing, brackets & side panel
+        //      (completely skipped when `players_orgs_enabled` is false to save CPU cycles)
+        let (scan_res, brackets, panel_entries, roster, confirmed_tracks, tentative_tracks, note) =
+            if settings.players_orgs_enabled {
+                // 3. Configure detector scan region from TrackingBoundary
+                let boundary = TrackingBoundary::from_settings(settings);
+                self.detector.settings_mut().region_left = boundary.left;
+                self.detector.settings_mut().region_top = boundary.top;
+                self.detector.settings_mut().region_right = boundary.right;
+                self.detector.settings_mut().region_bottom = boundary.bottom;
 
-        let collect_debug_boxes = settings.debug_overlay_enabled && settings.debug_show_candidates;
+                let collect_debug_boxes =
+                    settings.debug_overlay_enabled && settings.debug_show_candidates;
 
-        // 4. Detect & read candidate nameplates
-        let mut scan_res =
-            self.scan_and_read_plates(&frame.bgr, now_ms, social, collect_debug_boxes);
+                // 4. Detect & read candidate nameplates
+                let mut scan_res = self.scan_and_read_plates(
+                    &frame.bgr,
+                    now_ms,
+                    social,
+                    collect_debug_boxes,
+                );
 
-        // 5. Update Hungarian + sub-pixel velocity tracker
-        let forgotten = self.tracker.update(
-            &scan_res.observations,
-            now_ms,
-            settings.tracking_loss_display_seconds as f64,
-            win_w,
-            win_h,
-            boundary,
-            &self.pipeline_settings,
-        );
-        for id in forgotten {
-            self.white_dupes.forget(id);
-        }
-
-        // 6. Attach RSI identities & queue lookups for confirmed handles
-        self.resolve_tracked_identities(now_ms, social);
-
-        if collect_debug_boxes {
-            for m in &self.tracker.markers {
-                if m.status != PlateStatus::Confirmed && scan_res.debug_boxes.len() < 64 {
-                    let (pred_box, _) = m.predict_box(now_ms, &self.pipeline_settings);
-                    scan_res.debug_boxes.push(DebugCandidateBox {
-                        rect: pred_box,
-                        kind: DebugBoxKind::TentativeTrack,
-                    });
+                // 5. Update Hungarian + sub-pixel velocity tracker
+                let forgotten = self.tracker.update(
+                    &scan_res.observations,
+                    now_ms,
+                    settings.tracking_loss_display_seconds as f64,
+                    win_w,
+                    win_h,
+                    boundary,
+                    &self.pipeline_settings,
+                );
+                for id in forgotten {
+                    self.white_dupes.forget(id);
                 }
-            }
-        }
 
-        // 7. Build bracket items with WhiteDuplicateRule + Green party duplicate rule
-        let brackets = self.build_brackets(now_ms, social);
+                // 6. Attach RSI identities & queue lookups for confirmed handles
+                self.resolve_tracked_identities(now_ms, social);
 
-        // 8. Build right-side panel entries (live + stale within panel_stale_ms)
-        let panel_entries = self.build_panel_entries(now_ms, social);
+                if collect_debug_boxes {
+                    for m in &self.tracker.markers {
+                        if m.status != PlateStatus::Confirmed && scan_res.debug_boxes.len() < 64 {
+                            let (pred_box, _) = m.predict_box(now_ms, &self.pipeline_settings);
+                            scan_res.debug_boxes.push(DebugCandidateBox {
+                                rect: pred_box,
+                                kind: DebugBoxKind::TentativeTrack,
+                            });
+                        }
+                    }
+                }
+
+                // 7. Build bracket items with WhiteDuplicateRule + Green party duplicate rule
+                let brackets = self.build_brackets(now_ms, social);
+
+                // 8. Build right-side panel entries (live + stale within panel_stale_ms)
+                let panel_entries = self.build_panel_entries(now_ms, social);
+
+                let confirmed_tracks = self
+                    .tracker
+                    .markers
+                    .iter()
+                    .filter(|m| m.status == PlateStatus::Confirmed)
+                    .count();
+                let tentative_tracks = self.tracker.markers.len().saturating_sub(confirmed_tracks);
+                let note = if now_ms < self.aberration_note_until_ms {
+                    Some(AberrationWatch::NOTE_TEXT.to_string())
+                } else {
+                    None
+                };
+                let roster = InteractiveRoster::build(&self.tracker, now_ms);
+
+                (
+                    scan_res,
+                    brackets,
+                    panel_entries,
+                    roster,
+                    confirmed_tracks,
+                    tentative_tracks,
+                    note,
+                )
+            } else {
+                if !self.tracker.markers.is_empty()
+                    || !self.tracker.recently_ended.is_empty()
+                    || self.last_read_sample.is_some()
+                {
+                    self.reset_nameplate_tracking();
+                }
+                (
+                    ScanPlateResult {
+                        observations: Vec::new(),
+                        candidate_boxes: 0,
+                        candidate_pairs: 0,
+                        ocr_reads: 0,
+                        debug_boxes: Vec::new(),
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                    0,
+                    None,
+                )
+            };
 
         // 9. Mining HUD signal scanner
         let mining_labels = if !settings.mining_disabled {
@@ -403,19 +486,6 @@ impl LiveDetectionPipeline {
         };
 
         let mining_locked = mining_labels.first().map(|m| m.text.clone());
-        let confirmed_tracks = self
-            .tracker
-            .markers
-            .iter()
-            .filter(|m| m.status == PlateStatus::Confirmed)
-            .count();
-        let tentative_tracks = self.tracker.markers.len().saturating_sub(confirmed_tracks);
-
-        let note = if now_ms < self.aberration_note_until_ms {
-            Some(AberrationWatch::NOTE_TEXT.to_string())
-        } else {
-            None
-        };
 
         let model = OverlayModel {
             window_width: win_w,
@@ -433,7 +503,6 @@ impl LiveDetectionPipeline {
             waypoint_info: None,
         };
 
-        let roster = InteractiveRoster::build(&self.tracker, now_ms);
         let stats = PipelineStats {
             tick: self.tick_counter,
             process_ms: process_start.elapsed().as_secs_f64() * 1000.0,

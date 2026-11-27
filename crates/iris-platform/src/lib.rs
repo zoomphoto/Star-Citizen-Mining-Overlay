@@ -44,17 +44,22 @@ impl Default for GameWindowInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyAction {
     ToggleOverlay,
+    TogglePlayersOrgs,
     TimedOverlay,
     InteractiveOverlay,
     SaveWaypoint,
+    RadarZoomIn,
+    RadarZoomOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     OpenSettings,
     ToggleOverlay,
+    TogglePlayersOrgs,
     ToggleDebugOverlay,
     SaveWaypoint,
+    CycleRadarScale,
     ClearBreadcrumbs,
     OpenLogs,
     OpenConfigDir,
@@ -115,7 +120,9 @@ pub trait HotkeyListener: Send {
 
 pub trait TrayBackend: Send {
     fn set_overlay_enabled(&mut self, enabled: bool);
+    fn set_players_orgs_enabled(&mut self, enabled: bool);
     fn set_debug_enabled(&mut self, enabled: bool);
+    fn set_radar_range_km(&mut self, range_km: i32);
     fn try_recv(&self) -> Option<TrayAction>;
 }
 
@@ -187,7 +194,8 @@ pub fn create_display_info_ocr() -> Box<dyn DisplayInfoOcrReader> {
 
 /// Converts a top-right BGR24 crop into an upscaled (up to 3x, capped at 3600px for WinRT
 /// `OcrEngine::MaxImageDimension()`), dark-on-light grayscale image (`Gray8`) optimized for OCR
-/// of Star Citizen's small `r_DisplayInfo` text.
+/// of Star Citizen's small `r_DisplayInfo` text — using fast local adaptive background subtraction
+/// so bright daytime planets, clouds, or cockpit glare never wash out the telemetry text.
 pub(crate) fn prepare_display_info_gray_3x(
     bgr: &[u8],
     width: usize,
@@ -198,27 +206,52 @@ pub(crate) fn prepare_display_info_gray_3x(
     }
     let count = width * height;
     let mut lum = vec![0u8; count];
-    let mut max_l = 0u8;
-    let mut sum_l = 0u64;
     for (i, px) in bgr.chunks_exact(3).take(count).enumerate() {
         let luma = ((px[2] as u32 * 77 + px[1] as u32 * 150 + px[0] as u32 * 29) >> 8) as u8;
         let max_ch = px[0].max(px[1]).max(px[2]);
-        let v = ((luma as u16 + max_ch as u16) / 2) as u8;
-        lum[i] = v;
-        sum_l += v as u64;
-        if v > max_l {
-            max_l = v;
+        lum[i] = ((luma as u16 + max_ch as u16) / 2) as u8;
+    }
+
+    // Compute a fast 2D integral image to get each pixel's local 19x19 background luminance.
+    // Bright r_DisplayInfo glyph strokes stand out sharply above their immediate neighborhood
+    // both against black space AND against bright planetary clouds/terrain.
+    let stride = width + 1;
+    let mut sat = vec![0u32; stride * (height + 1)];
+    for y in 0..height {
+        let mut row_sum = 0u32;
+        let src_row = y * width;
+        let dst_row = (y + 1) * stride;
+        let prev_row = y * stride;
+        for x in 0..width {
+            row_sum += lum[src_row + x] as u32;
+            sat[dst_row + x + 1] = sat[prev_row + x + 1] + row_sum;
         }
     }
 
-    let mean_l = (sum_l / count as u64) as f32;
-    let lo = (mean_l + 8.0).min((max_l as f32) - 40.0).max(0.0);
-    let hi = (max_l as f32).max(lo + 48.0);
-    let span = (hi - lo).max(48.0);
-    for v in &mut lum {
-        let norm = ((*v as f32 - lo) / span).clamp(0.0, 1.0);
-        let crisp = norm.powf(0.85);
-        *v = ((1.0 - crisp) * 255.0).round() as u8;
+    let rad: isize = 9;
+    let mut enhanced = vec![255u8; count];
+    for y in 0..height {
+        let y0 = (y as isize - rad).max(0) as usize;
+        let y1 = (y as isize + rad + 1).min(height as isize) as usize;
+        let r0 = y0 * stride;
+        let r1 = y1 * stride;
+        let row_out = y * width;
+        for x in 0..width {
+            let x0 = (x as isize - rad).max(0) as usize;
+            let x1 = (x as isize + rad + 1).min(width as isize) as usize;
+            let area = ((y1 - y0) * (x1 - x0)) as u32;
+            let sum = sat[r1 + x1] + sat[r0 + x0] - sat[r1 + x0] - sat[r0 + x1];
+            let local_bg = (sum / area.max(1)) as f32;
+            let v = lum[row_out + x] as f32;
+
+            // Measure how much brighter this pixel is than its local 19x19 background.
+            // Over bright sky (bg ~210), white text (250) still has diff ~40 -> crisp ink.
+            // Smooth bright clouds (bg ~220, v ~220) have diff ~0 -> clean white paper.
+            let diff = (v - local_bg).max(0.0);
+            let span = (255.0 - local_bg).clamp(28.0, 95.0);
+            let ink = ((diff - 6.0) / span).clamp(0.0, 1.0).powf(0.8);
+            enhanced[row_out + x] = ((1.0 - ink) * 255.0).round() as u8;
+        }
     }
 
     // Choose integer scale up to 3x while staying strictly below WinRT OcrEngine's 4096px limit
@@ -233,7 +266,7 @@ pub(crate) fn prepare_display_info_gray_3x(
     let w3 = width * scale;
     let h3 = height * scale;
     if scale == 1 {
-        return (lum, w3, h3);
+        return (enhanced, w3, h3);
     }
     let inv_s = 1.0 / scale as f32;
     let mut out = vec![0u8; w3 * h3];
@@ -250,10 +283,10 @@ pub(crate) fn prepare_display_info_gray_3x(
             let x0 = (sx.floor().max(0.0) as usize).min(width - 1);
             let x1 = (x0 + 1).min(width - 1);
             let fx = (sx - x0 as f32).clamp(0.0, 1.0);
-            let a = lum[row0 + x0] as f32;
-            let b = lum[row0 + x1] as f32;
-            let c = lum[row1 + x0] as f32;
-            let d = lum[row1 + x1] as f32;
+            let a = enhanced[row0 + x0] as f32;
+            let b = enhanced[row0 + x1] as f32;
+            let c = enhanced[row1 + x0] as f32;
+            let d = enhanced[row1 + x1] as f32;
             let top = a + (b - a) * fx;
             let bot = c + (d - c) * fx;
             out[dst_row + x3] = (top + (bot - top) * fy).round().clamp(0.0, 255.0) as u8;
@@ -264,20 +297,26 @@ pub(crate) fn prepare_display_info_gray_3x(
 
 pub fn create_tray_backend(
     overlay_enabled: bool,
+    players_orgs_enabled: bool,
     debug_enabled: bool,
+    radar_range_km: i32,
 ) -> anyhow::Result<Box<dyn TrayBackend>> {
     #[cfg(windows)]
     {
         Ok(Box::new(win32::Win32TrayBackend::new(
             overlay_enabled,
+            players_orgs_enabled,
             debug_enabled,
+            radar_range_km,
         )?))
     }
     #[cfg(target_os = "linux")]
     {
         Ok(Box::new(linux::LinuxTrayBackend::new(
             overlay_enabled,
+            players_orgs_enabled,
             debug_enabled,
+            radar_range_km,
         )?))
     }
 }

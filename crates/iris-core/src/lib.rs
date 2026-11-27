@@ -153,7 +153,9 @@ mod tests {
         };
         db.save_player(&po, "test", now).unwrap();
 
-        let fetched = db.get_player("citizenone").expect("case-insensitive lookup");
+        let fetched = db
+            .get_player("citizenone")
+            .expect("case-insensitive lookup");
         assert_eq!(fetched.handle, "CitizenOne");
         assert_eq!(fetched.orgs.len(), 1);
         assert_eq!(fetched.orgs[0].sid.as_deref(), Some("TESTORG"));
@@ -259,7 +261,10 @@ mod tests {
         );
 
         let pin = DigitTemplates::pin_template();
-        assert_eq!(pin.len(), DigitTemplates::PIN_WIDTH * DigitTemplates::PIN_HEIGHT);
+        assert_eq!(
+            pin.len(),
+            DigitTemplates::PIN_WIDTH * DigitTemplates::PIN_HEIGHT
+        );
         let blank_patch = vec![0.0f32; DigitTemplates::WIDTH * DigitTemplates::HEIGHT];
         let (digit, _score, _all) = DigitTemplates::match_patch(&blank_patch, 0.08, false);
         assert!(digit.is_ascii_digit());
@@ -269,8 +274,8 @@ mod tests {
     fn hungarian_solver_and_lookalikes() {
         let cost = [
             10.0, 1.0, 9.0, 9.0, // row 0 -> col 1 (1.0)
-            9.0, 9.0, 2.0, 8.0,  // row 1 -> col 2 (2.0)
-            3.0, 9.0, 9.0, 7.0,  // row 2 -> col 0 (3.0)
+            9.0, 9.0, 2.0, 8.0, // row 1 -> col 2 (2.0)
+            3.0, 9.0, 9.0, 7.0, // row 2 -> col 0 (3.0)
         ];
         let assigned = Hungarian::solve(&cost, 3, 4).expect("valid assignment");
         assert_eq!(assigned, vec![1, 2, 0]);
@@ -307,7 +312,10 @@ mod tests {
         let bgra = painter.paint(&model, &settings, 1920, 1080);
         assert_eq!(bgra.len(), 1920 * 1080 * 4);
         let non_zero_alpha = bgra.chunks_exact(4).filter(|px| px[3] > 0).count();
-        assert!(non_zero_alpha > 500, "expected visible rendered overlay pixels");
+        assert!(
+            non_zero_alpha > 500,
+            "expected visible rendered overlay pixels"
+        );
 
         let metrics = BracketMetrics::for_box(PixelRect::new(100.0, 100.0, 120.0, 20.0), 1080.0);
         assert!(metrics.stroke > 0.0);
@@ -431,7 +439,11 @@ mod tests {
         let mut painter = SoftwareOverlayPainter::new();
         let bgra = painter.paint(&model, &settings, 1920, 1080);
         let visible = bgra.chunks_exact(4).filter(|px| px[3] > 0).count();
-        assert!(visible > 2000, "expected visible breadcrumb cloud pixels, got {}", visible);
+        assert!(
+            visible > 2000,
+            "expected visible breadcrumb cloud pixels, got {}",
+            visible
+        );
         // Premultiplied BGRA8 invariant (B, G, R <= A)
         assert!(bgra
             .chunks_exact(4)
@@ -454,7 +466,8 @@ mod tests {
         assert!(stab.ingest(parsed, true, t0).is_some());
         let glitch = SpaceCoord::new(parsed.x + 500_000.0, parsed.y, parsed.z);
         assert!(
-            stab.ingest(glitch, false, t0 + Duration::seconds(4)).is_none(),
+            stab.ingest(glitch, false, t0 + Duration::seconds(4))
+                .is_none(),
             "single-frame 500 km glitch must be rejected"
         );
         let smooth_move = SpaceCoord::new(parsed.x + 1200.0, parsed.y + 400.0, parsed.z);
@@ -464,6 +477,38 @@ mod tests {
         assert!(stab.should_auto_drop(parsed, 30, t0));
         assert!(!stab.should_auto_drop(smooth_move, 30, t0 + Duration::seconds(10)));
         assert!(stab.should_auto_drop(smooth_move, 30, t0 + Duration::seconds(31)));
+
+        // Verify planetary zone-locked breadcrumbs detect backtracking even after 30 km Root rotation!
+        let mut p_trail = BreadcrumbTrail::default();
+        let p_local_a = SpaceCoord::new(-211_765.0, 142_670.0, -127_938.0);
+        let p_local_b = SpaceCoord::new(-211_765.0, 150_670.0, -127_938.0); // 8 km away
+        let root_a = SpaceCoord::new(-48_118_000_000.0, 48_502_000_000.0, -127_938.0);
+        let root_rotated = SpaceCoord::new(-48_118_030_000.0, 48_502_020_000.0, -127_938.0);
+        p_trail.record_with_local(root_a, Some(("pyro6".into(), p_local_a)), 5.0, None, t0);
+        p_trail.record_with_local(
+            root_rotated,
+            Some(("pyro6".into(), p_local_b)),
+            5.0,
+            None,
+            t0 + Duration::seconds(45),
+        );
+        // Now backtrack back to within 1 km of p_local_a (60s later, Root rotated 30+ km away!)
+        let backtracked = SpaceCoord::new(-211_765.0, 143_670.0, -127_938.0);
+        let bc_info = p_trail
+            .build_overlay_info_dual(
+                5.0,
+                15.0,
+                true,
+                Some(root_rotated),
+                Some(("pyro6", backtracked)),
+                t0 + Duration::seconds(60),
+            )
+            .expect("planetary breadcrumb overlay info");
+        assert_eq!(
+            bc_info.zone,
+            ProximityZone::Visited,
+            "backtracking over a planetary breadcrumb must trigger VISITED even after Root rotation"
+        );
     }
 
     #[test]
@@ -561,7 +606,9 @@ mod tests {
     #[test]
     fn waypoints_storage_guidance_and_hud_render() {
         use crate::breadcrumbs::SpaceCoord;
-        use crate::waypoints::{format_distance_m, HeadingTracker, WaypointGuidance, WaypointStore};
+        use crate::waypoints::{
+            format_distance_m, HeadingTracker, WaypointGuidance, WaypointStore,
+        };
 
         // 1. Hotkey & settings roundtrip for Alt+Shift+P
         let mut settings = AppSettings::default();
@@ -636,7 +683,14 @@ mod tests {
         assert!(g_ahead.show_ring_marker);
 
         // Flying North (+Y), target is directly East (+X): should steer RIGHT 90 deg (rel_yaw ~ -pi/2)
-        let east_wp = store.add_point(SpaceCoord::new(5_000.0, 100.0, 0.0), Some("East".into()), None, None, None, t0);
+        let east_wp = store.add_point(
+            SpaceCoord::new(5_000.0, 100.0, 0.0),
+            Some("East".into()),
+            None,
+            None,
+            None,
+            t0,
+        );
         let g_right = WaypointGuidance::build_overlay_info(
             &east_wp,
             Some(SpaceCoord::new(0.0, 100.0, 0.0)),
@@ -648,7 +702,14 @@ mod tests {
         assert!(g_right.steering_text.starts_with("RIGHT"));
 
         // Target directly West (-X): should steer LEFT 90 deg (rel_yaw ~ +pi/2)
-        let west_wp = store.add_point(SpaceCoord::new(-5_000.0, 100.0, 0.0), Some("West".into()), None, None, None, t0);
+        let west_wp = store.add_point(
+            SpaceCoord::new(-5_000.0, 100.0, 0.0),
+            Some("West".into()),
+            None,
+            None,
+            None,
+            t0,
+        );
         let g_left = WaypointGuidance::build_overlay_info(
             &west_wp,
             Some(SpaceCoord::new(0.0, 100.0, 0.0)),
@@ -686,7 +747,11 @@ mod tests {
         let mut painter = SoftwareOverlayPainter::new();
         let bgra = painter.paint(&wp_model, &render_settings, 1920, 1080);
         let visible = bgra.chunks_exact(4).filter(|px| px[3] > 0).count();
-        assert!(visible > 2000, "expected visible waypoint HUD pixels, got {}", visible);
+        assert!(
+            visible > 2000,
+            "expected visible waypoint HUD pixels, got {}",
+            visible
+        );
         assert!(bgra
             .chunks_exact(4)
             .all(|px| px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]));
@@ -712,16 +777,24 @@ mod tests {
 
         // LocalBodyStabilizer requires 2 consistent frames then tracks smoothly & rejects glitches
         let mut bstab = LocalBodyStabilizer::default();
-        assert!(bstab.ingest(disp_z.clone(), norm_z.clone(), body_c, t0).is_none());
+        assert!(bstab
+            .ingest(disp_z.clone(), norm_z.clone(), body_c, t0)
+            .is_none());
         let (_, _, acc_body) = bstab
-            .ingest("pyro6".to_string(), "pyro6".to_string(), body_c, t0 + Duration::seconds(1))
+            .ingest(
+                "pyro6".to_string(),
+                "pyro6".to_string(),
+                body_c,
+                t0 + Duration::milliseconds(500),
+            )
             .expect("2nd consistent frame should lock planetary body");
+        // Single-frame 3 km OCR digit typo in 200 ms must be rejected!
         assert!(bstab
             .ingest(
                 "pyro6".to_string(),
                 "pyro6".to_string(),
-                SpaceCoord::new(body_c.x + 900_000.0, body_c.y, body_c.z),
-                t0 + Duration::seconds(2)
+                SpaceCoord::new(body_c.x + 3_000.0, body_c.y, body_c.z),
+                t0 + Duration::milliseconds(700)
             )
             .is_none());
 
@@ -755,8 +828,201 @@ mod tests {
             true,
             5000.0,
         );
-        assert!(locked_guidance.zone_lock.is_some(), "expected planetary zone lock");
-        assert!(locked_guidance.arrived, "standing still in pyr06 must stay 0m (ARRIVED) despite 25 km Root rotation!");
+        assert!(
+            locked_guidance.zone_lock.is_some(),
+            "expected planetary zone lock"
+        );
+        assert!(
+            locked_guidance.arrived,
+            "standing still in pyr06 must stay 0m (ARRIVED) despite 25 km Root rotation!"
+        );
         assert!(locked_guidance.distance_m < 1.0);
+
+        // 8. Spherical Planetary ENU Tangent-Plane Navigation (equator test on R = 500 km planet)
+        let eq_cur = SpaceCoord::new(500_000.0, 0.0, 0.0);
+        // Target 10 km East along equator (+Y at (R, 0, 0)), 500 m higher altitude (+X is radial Up!)
+        let eq_east_wp = store.add_point_with_local(
+            SpaceCoord::new(0.0, 0.0, 0.0),
+            Some((
+                "pyro6".to_string(),
+                SpaceCoord::new(500_500.0, 10_000.0, 0.0),
+            )),
+            Some("Equator East".to_string()),
+            Some("pyro6".to_string()),
+            None,
+            Some(OverlayColor::Cyan),
+            t0,
+        );
+        // Ship flying straight North along the equator (+Z is North at the equator!)
+        let mut eq_heading = HeadingTracker::default();
+        eq_heading.push(SpaceCoord::new(500_000.0, 0.0, -200.0), 1000.0);
+        eq_heading.push(eq_cur, 1500.0);
+        let eq_fix = LivePositionFix {
+            root: None,
+            body: Some(("pyro6".to_string(), "pyro6".to_string(), eq_cur)),
+            display_zone: Some("pyro6".to_string()),
+        };
+        let eq_g = WaypointGuidance::build_overlay_info_dual(
+            &eq_east_wp,
+            &eq_fix,
+            &empty_heading,
+            &eq_heading,
+            true,
+            1500.0,
+        );
+        assert!(
+            (eq_g.world_bearing_deg - 90.0).abs() < 1.5,
+            "expected ~090° East compass heading on equator, got {:.1}°",
+            eq_g.world_bearing_deg
+        );
+        assert!(
+            eq_g.steering_text.starts_with("RIGHT"),
+            "flying North (+Z) toward East (+Y) on equator must steer RIGHT, got {}",
+            eq_g.steering_text
+        );
+        assert!(
+            eq_g.vertical_text.contains("UP"),
+            "500 m higher radial altitude must show UP, got {}",
+            eq_g.vertical_text
+        );
+        assert!(
+            eq_g.subline.contains("HDG 090°"),
+            "planetary subline should include zero-lag compass heading, got {}",
+            eq_g.subline
+        );
+    }
+
+    #[test]
+    fn players_orgs_toggle_settings_and_pipeline_bypass() {
+        use crate::config::DataPaths;
+        use crate::lookup::RsiClient;
+        use crate::pipeline::{CapturedFrame, LiveDetectionPipeline};
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+
+        // 1. Default settings enable Players & Orgs with Shift+F11 hotkey
+        let defaults = AppSettings::default();
+        assert!(defaults.players_orgs_enabled);
+        assert_eq!(defaults.hotkey_toggle_players_orgs, "Shift+F11");
+
+        // 2. Legacy settings.txt without `players_orgs_enabled` defaults to enabled
+        let legacy_loaded = AppSettingsToml::read("format_version = 1\noverlay_disabled = false\n");
+        assert!(legacy_loaded.is_valid());
+        assert!(legacy_loaded.settings.players_orgs_enabled);
+
+        // 3. Explicit false + custom hotkey round-trips cleanly
+        let custom = AppSettings {
+            players_orgs_enabled: false,
+            hotkey_toggle_players_orgs: "Ctrl+Shift+P".to_string(),
+            ..AppSettings::default()
+        };
+        let reloaded = AppSettingsToml::read(&AppSettingsToml::write(&custom));
+        assert!(reloaded.is_valid(), "errors: {:?}", reloaded.errors);
+        assert!(!reloaded.settings.players_orgs_enabled);
+        assert_eq!(reloaded.settings.hotkey_toggle_players_orgs, "Ctrl+Shift+P");
+
+        // 4. LiveDetectionPipeline skips all nameplate scanning when `players_orgs_enabled` is false
+        let paths = DataPaths::resolve(false);
+        let cache = Arc::new(CacheDatabase::open_in_memory().expect("in-memory sqlite"));
+        let notes = Arc::new(RwLock::new(DossierNotes::new(
+            DossierNotes::DEFAULT_MAX_FILE_BYTES,
+        )));
+        let client = Arc::new(RsiClient::new().expect("rsi client"));
+        let mut pipeline = LiveDetectionPipeline::new(paths, cache, notes, client);
+
+        // Non-black synthetic frame with bright high-contrast stripes that would normally generate candidate boxes
+        let (w, h) = (640usize, 360usize);
+        let mut bgr = vec![30u8; w * h * 3];
+        for y in 120..136 {
+            for x in 200..320 {
+                let idx = (y * w + x) * 3;
+                bgr[idx] = 255;
+                bgr[idx + 1] = 255;
+                bgr[idx + 2] = 255;
+            }
+        }
+        let frame = CapturedFrame::from_bgr8(w, h, bgr, 1_000.0);
+        let social = SocialConfig::default();
+        let off_settings = AppSettings {
+            players_orgs_enabled: false,
+            mining_disabled: true,
+            ..AppSettings::default()
+        };
+
+        let snap = pipeline.process_frame(&frame, &off_settings, &social);
+        assert_eq!(snap.stats.candidate_boxes, 0);
+        assert_eq!(snap.stats.candidate_pairs, 0);
+        assert_eq!(snap.stats.ocr_reads, 0);
+        assert_eq!(snap.stats.confirmed_tracks, 0);
+        assert_eq!(snap.stats.tentative_tracks, 0);
+        assert!(snap.model.brackets.is_empty());
+        assert!(snap.model.panel_entries.is_empty());
+        assert!(snap.roster.is_empty());
+    }
+
+    #[test]
+    fn breadcrumb_radar_scale_presets_filter_and_render() {
+        use crate::breadcrumbs::{BreadcrumbTrail, SpaceCoord};
+
+        // 1. Default Auto = 0 -> effective 3x visited_radius_km (5 * 3 = 15 km)
+        let mut s = AppSettings::default();
+        assert_eq!(s.breadcrumbs_radar_range_km, 0);
+        assert!((s.effective_breadcrumb_radar_km() - 15.0).abs() < 0.01);
+
+        // 2. Step zoom out / zoom in across 1..1000 km presets
+        assert_eq!(AppSettings::step_breadcrumb_radar_km(0, 5, 1, false), 25);
+        assert_eq!(AppSettings::step_breadcrumb_radar_km(0, 5, -1, false), 10);
+        assert_eq!(AppSettings::step_breadcrumb_radar_km(10, 5, -1, false), 5);
+        assert_eq!(AppSettings::step_breadcrumb_radar_km(1, 5, -1, false), 1);
+        assert_eq!(AppSettings::step_breadcrumb_radar_km(100, 5, 1, false), 250);
+        assert_eq!(AppSettings::step_breadcrumb_radar_km(1000, 5, 1, false), 1000);
+        assert_eq!(AppSettings::step_breadcrumb_radar_km(1000, 5, 1, true), 0);
+
+        // 3. Settings TOML round-trip
+        s.breadcrumbs_radar_range_km = 100;
+        let reloaded = AppSettingsToml::read(&AppSettingsToml::write(&s));
+        assert!(reloaded.is_valid(), "errors: {:?}", reloaded.errors);
+        assert_eq!(reloaded.settings.breadcrumbs_radar_range_km, 100);
+        assert_eq!(reloaded.settings.hotkey_radar_zoom_in, "Alt+Shift+[");
+        assert_eq!(reloaded.settings.hotkey_radar_zoom_out, "Alt+Shift+]");
+
+        // 4. Wide scale (500 km) retains distant points beyond legacy 250 km cap and renders cleanly
+        let mut trail = BreadcrumbTrail::default();
+        let t0 = Utc::now();
+        let p0 = SpaceCoord::new(0.0, 0.0, 0.0);
+        let p_far = SpaceCoord::new(400_000.0, 0.0, 0.0); // 400 km away
+        trail.record(p0, 5.0, None, t0);
+        trail.record(p_far, 5.0, None, t0 + Duration::minutes(5));
+
+        let info_500 = trail
+            .build_overlay_info(5.0, 500.0, true, Some(p0), t0 + Duration::minutes(6))
+            .expect("overlay info");
+        assert!((info_500.radar_range_km - 500.0).abs() < 0.01);
+        assert!(
+            info_500.points.iter().any(|pt| (pt.dx_km - 400.0).abs() < 0.1),
+            "500 km radar scale must retain 400 km distant point"
+        );
+
+        let social = SocialConfig::default();
+        let mut painter = SoftwareOverlayPainter::new();
+        for km in [1, 10, 100, 1000] {
+            let preview_settings = AppSettings {
+                breadcrumbs_radar_range_km: km,
+                ..AppSettings::default()
+            };
+            let model = TestOverlayBuilder::build(
+                &social,
+                1920.0,
+                1080.0,
+                None,
+                TestOverlayPart::Breadcrumbs,
+                Some(&preview_settings),
+            );
+            let bgra = painter.paint(&model, &preview_settings, 1920, 1080);
+            assert!(bgra.chunks_exact(4).any(|px| px[3] > 0));
+            assert!(bgra
+                .chunks_exact(4)
+                .all(|px| px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]));
+        }
     }
 }

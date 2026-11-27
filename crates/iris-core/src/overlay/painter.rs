@@ -1069,16 +1069,20 @@ impl SoftwareOverlayPainter {
         };
         let radar_clip_path = PathBuilder::from_rect(sk_radar);
 
-        // Keep a crisp local mining zoom (3x visited_radius_km, e.g. 15 km radius = 30 km across
-        // for a 5 km cloud) so distant 100+ km trail points never squash your local turns & circles.
-        let max_extent_km = (bc.visited_radius_km * 3.0).max(10.0);
+        // Scale radar extent from user-selected zoom (1 km .. 1000 km), or fallback to 3x visited_radius_km.
+        let max_extent_km = if bc.radar_range_km > 0.0 {
+            bc.radar_range_km.clamp(0.5, 5_000.0)
+        } else {
+            (bc.visited_radius_km * 3.0).max(10.0)
+        };
         let half_w = r_rect.width * 0.5;
         let half_h = r_rect.height * 0.5;
+        let max_r = half_w.min(half_h);
         let cx = r_rect.x + half_w;
         let cy = r_rect.y + half_h;
-        let px_per_km = half_w.min(half_h) / max_extent_km;
+        let px_per_km = max_r / max_extent_km;
         let cloud_radius_px =
-            ((bc.visited_radius_km * px_per_km) as f32).max(10.0 * layout.scale as f32);
+            ((bc.visited_radius_km * px_per_km) as f32).max(2.5 * layout.scale as f32);
 
         // Build a lightweight clip mask for the inner radar viewport so corridor clouds never bleed
         // outside the radar border.
@@ -1125,8 +1129,9 @@ impl SoftwareOverlayPainter {
                     let mut outer_p = Paint::default();
                     outer_p.set_color_rgba8(cr, cg, cb, 40);
                     outer_p.anti_alias = true;
+                    let s = layout.scale as f32;
                     let outer_w =
-                        (cloud_radius_px * 1.45).clamp(10.0, (r_rect.height as f32) * 0.45);
+                        (cloud_radius_px * 1.45).clamp(4.0 * s, (r_rect.height as f32) * 0.45);
                     let outer_stroke = Stroke {
                         width: outer_w,
                         line_cap: tiny_skia::LineCap::Round,
@@ -1144,7 +1149,8 @@ impl SoftwareOverlayPainter {
                     let mut mid_p = Paint::default();
                     mid_p.set_color_rgba8(cr, cg, cb, 70);
                     mid_p.anti_alias = true;
-                    let mid_w = (cloud_radius_px * 0.72).clamp(6.0, (r_rect.height as f32) * 0.25);
+                    let mid_w =
+                        (cloud_radius_px * 0.72).clamp(2.5 * s, (r_rect.height as f32) * 0.25);
                     let mid_stroke = Stroke {
                         width: mid_w,
                         line_cap: tiny_skia::LineCap::Round,
@@ -1226,18 +1232,27 @@ impl SoftwareOverlayPainter {
             pixmap.stroke_path(&p, &grid_paint, &thin_stroke, Transform::identity(), None);
         }
 
-        for (mult, col) in [
-            (1.0f32, Color::from_rgba8(zr, zg, zb, 0x66)),
-            (2.0f32, Color::from_rgba8(0x90, 0xA4, 0xB8, 0x2E)),
-        ] {
-            let ring_r = cloud_radius_px * mult;
-            if ring_r >= 4.0 && ring_r < (half_w.min(half_h) as f32) - 2.0 {
+        // 50% and 100% radar scale rings (always reflect active zoom: 1 km, 5 km, 10 km, 100 km...)
+        for frac in [0.5f32, 0.96f32] {
+            let ring_r = (max_r as f32) * frac;
+            if ring_r >= 4.0 {
                 if let Some(ring_path) = PathBuilder::from_circle(cx as f32, cy as f32, ring_r) {
                     let mut rp = Paint::default();
-                    rp.set_color(col);
+                    rp.set_color(Color::from_rgba8(0x90, 0xA4, 0xB8, 0x2E));
                     rp.anti_alias = true;
                     pixmap.stroke_path(&ring_path, &rp, &thin_stroke, Transform::identity(), None);
                 }
+            }
+        }
+        // Visited cloud boundary ring (colored by proximity zone when visible inside current zoom)
+        let visited_ring_r = (bc.visited_radius_km * px_per_km) as f32;
+        if visited_ring_r >= 3.5 && visited_ring_r < (max_r as f32) - 2.0 {
+            if let Some(ring_path) = PathBuilder::from_circle(cx as f32, cy as f32, visited_ring_r)
+            {
+                let mut rp = Paint::default();
+                rp.set_color(Color::from_rgba8(zr, zg, zb, 0x6E));
+                rp.anti_alias = true;
+                pixmap.stroke_path(&ring_path, &rp, &thin_stroke, Transform::identity(), None);
             }
         }
 
@@ -1461,6 +1476,35 @@ impl SoftwareOverlayPainter {
             layout.header_px,
             false,
             (zr, zg, zb),
+        );
+
+        // Crisp radar range readout in the top-right corner of the radar viewport (e.g. "R 100 km")
+        let eff_range_km = if bc.radar_range_km > 0.0 {
+            bc.radar_range_km.clamp(0.5, 5_000.0)
+        } else {
+            (bc.visited_radius_km * 3.0).max(10.0)
+        };
+        let range_label = if eff_range_km >= 10.0 || (eff_range_km - eff_range_km.round()).abs() < 0.05
+        {
+            format!("R {:.0} km", eff_range_km.round())
+        } else {
+            format!("R {:.1} km", eff_range_km)
+        };
+        let scale_px = (9.5 * layout.scale) as f32;
+        let (sw, sh) = Self::measure_text(&range_label, scale_px);
+        let inset = 5.0 * layout.scale;
+        Self::draw_outlined_text_rgb(
+            bgra,
+            w,
+            h,
+            &range_label,
+            (layout.radar_rect.right() - inset - sw as f64).max(layout.radar_rect.x + inset),
+            layout.radar_rect.y + inset,
+            (sw as f64 + 4.0).min(layout.radar_rect.width - 2.0 * inset),
+            (sh as f64).max(12.0 * layout.scale),
+            scale_px,
+            false,
+            (168, 214, 236),
         );
 
         let footer_y0 = layout.radar_rect.bottom() + 5.0 * layout.scale;

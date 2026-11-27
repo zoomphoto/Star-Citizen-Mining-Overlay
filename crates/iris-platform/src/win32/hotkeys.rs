@@ -19,9 +19,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[derive(Clone, Default)]
 struct ActiveBindings {
     toggle: Option<HotkeyChord>,
+    toggle_players_orgs: Option<HotkeyChord>,
     timed: Option<HotkeyChord>,
     interactive: Option<HotkeyChord>,
     save_waypoint: Option<HotkeyChord>,
+    radar_zoom_in: Option<HotkeyChord>,
+    radar_zoom_out: Option<HotkeyChord>,
 }
 
 struct HookGlobalState {
@@ -83,9 +86,12 @@ impl Win32HotkeyListener {
     fn parse_bindings(settings: &AppSettings) -> ActiveBindings {
         ActiveBindings {
             toggle: HotkeyText::parse(&settings.hotkey_toggle_overlay).ok(),
+            toggle_players_orgs: HotkeyText::parse(&settings.hotkey_toggle_players_orgs).ok(),
             timed: HotkeyText::parse(&settings.hotkey_timed_overlay).ok(),
             interactive: HotkeyText::parse(&settings.hotkey_interactive_overlay).ok(),
             save_waypoint: HotkeyText::parse(&settings.hotkey_save_waypoint).ok(),
+            radar_zoom_in: HotkeyText::parse(&settings.hotkey_radar_zoom_in).ok(),
+            radar_zoom_out: HotkeyText::parse(&settings.hotkey_radar_zoom_out).ok(),
         }
     }
 }
@@ -160,10 +166,16 @@ unsafe extern "system" fn low_level_kbd_proc(
                         let guard = state.bindings.read();
                         if matches(&guard.toggle) {
                             let _ = state.tx.send(HotkeyAction::ToggleOverlay);
+                        } else if matches(&guard.toggle_players_orgs) {
+                            let _ = state.tx.send(HotkeyAction::TogglePlayersOrgs);
                         } else if matches(&guard.interactive) {
                             let _ = state.tx.send(HotkeyAction::InteractiveOverlay);
                         } else if matches(&guard.save_waypoint) {
                             let _ = state.tx.send(HotkeyAction::SaveWaypoint);
+                        } else if matches(&guard.radar_zoom_in) {
+                            let _ = state.tx.send(HotkeyAction::RadarZoomIn);
+                        } else if matches(&guard.radar_zoom_out) {
+                            let _ = state.tx.send(HotkeyAction::RadarZoomOut);
                         } else if matches(&guard.timed) {
                             let _ = state.tx.send(HotkeyAction::TimedOverlay);
                         }

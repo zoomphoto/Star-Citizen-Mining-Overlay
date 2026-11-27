@@ -10,11 +10,15 @@ use std::time::Duration;
 pub enum IpcCommand {
     OpenSettings,
     ToggleOverlay,
+    TogglePlayersOrgs,
     ToggleDebugOverlay,
     TimedOverlay,
     InteractiveOverlay,
     SaveWaypoint,
     ClearBreadcrumbs,
+    RadarZoomIn,
+    RadarZoomOut,
+    CycleRadarScale,
     Quit,
 }
 
@@ -23,11 +27,15 @@ impl IpcCommand {
         match self {
             IpcCommand::OpenSettings => "settings",
             IpcCommand::ToggleOverlay => "toggle",
+            IpcCommand::TogglePlayersOrgs => "toggle_players",
             IpcCommand::ToggleDebugOverlay => "debug",
             IpcCommand::TimedOverlay => "timed",
             IpcCommand::InteractiveOverlay => "interactive",
             IpcCommand::SaveWaypoint => "save_waypoint",
             IpcCommand::ClearBreadcrumbs => "clear_breadcrumbs",
+            IpcCommand::RadarZoomIn => "radar_zoom_in",
+            IpcCommand::RadarZoomOut => "radar_zoom_out",
+            IpcCommand::CycleRadarScale => "radar_scale_cycle",
             IpcCommand::Quit => "quit",
         }
     }
@@ -36,11 +44,15 @@ impl IpcCommand {
         match s.trim() {
             "settings" => Some(IpcCommand::OpenSettings),
             "toggle" => Some(IpcCommand::ToggleOverlay),
+            "toggle_players" => Some(IpcCommand::TogglePlayersOrgs),
             "debug" => Some(IpcCommand::ToggleDebugOverlay),
             "timed" => Some(IpcCommand::TimedOverlay),
             "interactive" => Some(IpcCommand::InteractiveOverlay),
             "save_waypoint" => Some(IpcCommand::SaveWaypoint),
             "clear_breadcrumbs" => Some(IpcCommand::ClearBreadcrumbs),
+            "radar_zoom_in" => Some(IpcCommand::RadarZoomIn),
+            "radar_zoom_out" => Some(IpcCommand::RadarZoomOut),
+            "radar_scale_cycle" => Some(IpcCommand::CycleRadarScale),
             "quit" => Some(IpcCommand::Quit),
             _ => None,
         }

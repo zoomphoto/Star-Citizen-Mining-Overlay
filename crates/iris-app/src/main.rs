@@ -46,11 +46,17 @@ impl CliOptions {
                 "--minimized" | "--tray" | "--silent" => opts.start_minimized = true,
                 "--settings" => opts.ipc_cmd = Some(IpcCommand::OpenSettings),
                 "--toggle" => opts.ipc_cmd = Some(IpcCommand::ToggleOverlay),
+                "--toggle-players" | "--players" => {
+                    opts.ipc_cmd = Some(IpcCommand::TogglePlayersOrgs)
+                }
                 "--debug" => opts.ipc_cmd = Some(IpcCommand::ToggleDebugOverlay),
                 "--timed" => opts.ipc_cmd = Some(IpcCommand::TimedOverlay),
                 "--interactive" => opts.ipc_cmd = Some(IpcCommand::InteractiveOverlay),
                 "--save-poi" => opts.ipc_cmd = Some(IpcCommand::SaveWaypoint),
                 "--clear-trail" => opts.ipc_cmd = Some(IpcCommand::ClearBreadcrumbs),
+                "--radar-zoom-in" => opts.ipc_cmd = Some(IpcCommand::RadarZoomIn),
+                "--radar-zoom-out" => opts.ipc_cmd = Some(IpcCommand::RadarZoomOut),
+                "--radar-scale-cycle" => opts.ipc_cmd = Some(IpcCommand::CycleRadarScale),
                 "--quit" => opts.ipc_cmd = Some(IpcCommand::Quit),
                 "-h" | "--help" => opts.print_help = true,
                 "-V" | "--version" => opts.print_version = true,
@@ -98,13 +104,17 @@ fn main() -> anyhow::Result<()> {
              OPTIONS:\n  \
                --settings      Open or focus the Settings window\n  \
                --minimized     Start hidden in the system tray\n  \
-               --toggle        Toggle the overlay on/off (signals running instance)\n  \
-               --debug         Toggle the live Debug / Heartbeat HUD on/off (signals running instance)\n  \
+               --toggle          Toggle the overlay on/off (signals running instance)\n  \
+               --toggle-players  Toggle Players & Orgs nameplate scanning on/off (CPU saver)\n  \
+               --debug           Toggle the live Debug / Heartbeat HUD on/off (signals running instance)\n  \
                --timed         Trigger timed overlay peek (signals running instance)\n  \
                --interactive   Open/close Interactive Citizen Dossier (signals running instance)\n  \
-               --save-poi      Save current position as a POI beacon (signals running instance)\n  \
-               --clear-trail   Clear recorded /showlocation mining breadcrumbs (signals running instance)\n  \
-               --quit          Stop a running SC Overlay instance\n  \
+               --save-poi          Save current position as a POI beacon (signals running instance)\n  \
+               --clear-trail       Clear recorded /showlocation mining breadcrumbs (signals running instance)\n  \
+               --radar-zoom-in     Zoom breadcrumb radar in one step (e.g. 100 km -> 50 km)\n  \
+               --radar-zoom-out    Zoom breadcrumb radar out one step (e.g. 10 km -> 25 km)\n  \
+               --radar-scale-cycle Cycle breadcrumb radar scale presets (1 km .. 1000 km / Auto)\n  \
+               --quit              Stop a running SC Overlay instance\n  \
                --portable      Store Config/, Data/, and Logs/ next to the executable\n  \
                -h, --help      Print help\n  \
                -V, --version   Print version",
@@ -165,11 +175,15 @@ fn main() -> anyhow::Result<()> {
         cli.ipc_cmd,
         Some(
             IpcCommand::ToggleOverlay
+                | IpcCommand::TogglePlayersOrgs
                 | IpcCommand::ToggleDebugOverlay
                 | IpcCommand::TimedOverlay
                 | IpcCommand::InteractiveOverlay
                 | IpcCommand::SaveWaypoint
                 | IpcCommand::ClearBreadcrumbs
+                | IpcCommand::RadarZoomIn
+                | IpcCommand::RadarZoomOut
+                | IpcCommand::CycleRadarScale
         )
     );
     let start_settings_open = !cli.start_minimized && !action_only;

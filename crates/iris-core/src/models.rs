@@ -420,6 +420,9 @@ pub struct BreadcrumbOverlayInfo {
     pub headline: String,
     pub subline: String,
     pub visited_radius_km: f64,
+    /// Radar viewport radius (center to edge) in km (`0.0` falls back to `3x visited_radius_km`, min 10 km).
+    #[serde(default)]
+    pub radar_range_km: f64,
     pub heading_rad: Option<f64>,
     pub show_screen_cloud: bool,
     pub points: Vec<BreadcrumbRenderPoint>,

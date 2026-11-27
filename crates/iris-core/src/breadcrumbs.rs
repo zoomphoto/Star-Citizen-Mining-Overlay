@@ -42,6 +42,31 @@ pub fn zones_match(a: &str, b: &str) -> bool {
     !na.is_empty() && na == nb
 }
 
+/// Orthonormal local East-North-Up (ENU) tangent frame at `pos` on a spherical planet/moon
+/// whose center is `(0, 0, 0)` and North Pole (OM-1) is `+Z = (0, 0, 1)`.
+///
+/// Projecting `delta` onto `(east, north)` gives true surface East/North coordinates at any latitude.
+pub fn planetary_enu_basis(pos: SpaceCoord) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
+    let r = (pos.x * pos.x + pos.y * pos.y + pos.z * pos.z).sqrt();
+    if r < 1_000.0 {
+        return None;
+    }
+    let up = [pos.x / r, pos.y / r, pos.z / r];
+    let raw_n = [-up[2] * up[0], -up[2] * up[1], 1.0 - up[2] * up[2]];
+    let n_len = (raw_n[0] * raw_n[0] + raw_n[1] * raw_n[1] + raw_n[2] * raw_n[2]).sqrt();
+    let north = if n_len > 1e-6 {
+        [raw_n[0] / n_len, raw_n[1] / n_len, raw_n[2] / n_len]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let east = [
+        north[1] * up[2] - north[2] * up[1],
+        north[2] * up[0] - north[0] * up[2],
+        north[0] * up[1] - north[1] * up[0],
+    ];
+    Some((east, north, up))
+}
+
 fn is_ship_or_interior_zone(zone_name: &str) -> bool {
     let lower = zone_name.to_ascii_lowercase();
     if lower.starts_with("rs_")
@@ -223,9 +248,8 @@ impl SpaceCoord {
             };
             let prefix = &line[..pos_idx];
             let zone_raw = if let Some(z_idx) = prefix.to_ascii_lowercase().find("zone") {
-                prefix[z_idx + 4..].trim_matches(|c: char| {
-                    c == ':' || c == ';' || c == '.' || c.is_whitespace()
-                })
+                prefix[z_idx + 4..]
+                    .trim_matches(|c: char| c == ':' || c == ';' || c == '.' || c.is_whitespace())
             } else {
                 // Handle slightly clipped "one: pyr06" / "e: pyr06" OCR prefix
                 prefix
@@ -265,10 +289,7 @@ impl SpaceCoord {
             }
         }
 
-        let display_zone = body
-            .as_ref()
-            .map(|(z, _, _)| z.clone())
-            .or(display_zone);
+        let display_zone = body.as_ref().map(|(z, _, _)| z.clone()).or(display_zone);
         DisplayInfoTelemetry {
             root,
             body,
@@ -287,7 +308,8 @@ impl SpaceCoord {
             let Some(z_idx) = lower.find("zone") else {
                 continue;
             };
-            let after = line[z_idx + 4..].trim_start_matches(|c: char| c == ':' || c == ';' || c.is_whitespace());
+            let after = line[z_idx + 4..]
+                .trim_start_matches(|c: char| c == ':' || c == ';' || c.is_whitespace());
             let Some(tok) = after.split_whitespace().next() else {
                 continue;
             };
@@ -341,7 +363,8 @@ impl SpaceCoord {
         let lower = line.to_ascii_lowercase();
         let pos_idx = lower.find("pos").or_else(|| lower.find("p0s"))?;
         let after = &line[pos_idx + 3..];
-        let after = after.trim_start_matches(|c: char| c == ':' || c == ';' || c == '.' || c.is_whitespace());
+        let after = after
+            .trim_start_matches(|c: char| c == ':' || c == ';' || c == '.' || c.is_whitespace());
 
         // Normalize common OCR confusions in numeric coordinate triplets
         let mut norm = String::with_capacity(after.len());
@@ -444,11 +467,20 @@ impl SpaceCoord {
         let mut z = None;
         for token in after_prefix.split_whitespace() {
             let clean = token.trim_matches(|c: char| c == ',' || c == ';' || c == ')');
-            if let Some(rest) = clean.strip_prefix("x:").or_else(|| clean.strip_prefix("X:")) {
+            if let Some(rest) = clean
+                .strip_prefix("x:")
+                .or_else(|| clean.strip_prefix("X:"))
+            {
                 x = rest.parse::<f64>().ok().filter(|v| v.is_finite());
-            } else if let Some(rest) = clean.strip_prefix("y:").or_else(|| clean.strip_prefix("Y:")) {
+            } else if let Some(rest) = clean
+                .strip_prefix("y:")
+                .or_else(|| clean.strip_prefix("Y:"))
+            {
                 y = rest.parse::<f64>().ok().filter(|v| v.is_finite());
-            } else if let Some(rest) = clean.strip_prefix("z:").or_else(|| clean.strip_prefix("Z:")) {
+            } else if let Some(rest) = clean
+                .strip_prefix("z:")
+                .or_else(|| clean.strip_prefix("Z:"))
+            {
                 z = rest.parse::<f64>().ok().filter(|v| v.is_finite());
             }
         }
@@ -467,6 +499,12 @@ pub struct BreadcrumbPoint {
     pub recorded_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Local planetary/moon body key (e.g. `"pyro6"`) when dropped near/on a rotating body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_zone: Option<String>,
+    /// Local coordinates inside `local_zone` (zero rotation drift on planets/moons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_coord: Option<SpaceCoord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -623,26 +661,53 @@ impl BreadcrumbTrail {
         self.evaluate_proximity_excluding_recent(coord, visited_radius_km, now, 0)
     }
 
-    /// Records a new `/showlocation` coordinate and returns its proximity to prior points.
-    pub fn record(
+    /// Records a new breadcrumb with optional planetary local-body coordinates so breadcrumbs on
+    /// rotating planets/moons never drift away when backtracking.
+    pub fn record_with_local(
         &mut self,
         coord: SpaceCoord,
+        local_body: Option<(String, SpaceCoord)>,
         visited_radius_km: f64,
         label: Option<String>,
         now: DateTime<Utc>,
     ) -> RecordOutcome {
+        let (local_zone, local_coord) = match local_body {
+            Some((z, c)) => {
+                let norm = normalize_zone_key(&z);
+                if norm.is_empty() {
+                    (None, None)
+                } else {
+                    (Some(norm), Some(c))
+                }
+            }
+            None => (None, None),
+        };
+
         if let Some(last) = self.points.last() {
-            if last.coord.distance_m(&coord) < Self::DUPLICATE_EPSILON_M {
+            let is_dup = match (&local_zone, local_coord, &last.local_zone, last.local_coord) {
+                (Some(lz), Some(lc), Some(prev_lz), Some(prev_lc)) if zones_match(lz, prev_lz) => {
+                    prev_lc.distance_m(&lc) < Self::DUPLICATE_EPSILON_M
+                }
+                _ => last.coord.distance_m(&coord) < Self::DUPLICATE_EPSILON_M,
+            };
+            if is_dup {
                 return RecordOutcome::Duplicate;
             }
         }
 
-        let proximity = self.evaluate_proximity(coord, visited_radius_km, now);
+        let proximity = if let (Some(lz), Some(lc)) = (local_zone.as_deref(), local_coord) {
+            self.evaluate_local_proximity_excluding_recent(lz, lc, visited_radius_km, now, 30)
+        } else {
+            self.evaluate_proximity(coord, visited_radius_km, now)
+        };
+
         let point = BreadcrumbPoint {
             id: self.next_id,
             coord,
             recorded_at: now,
             label,
+            local_zone,
+            local_coord,
         };
         self.next_id += 1;
         self.points.push(point.clone());
@@ -651,6 +716,105 @@ impl BreadcrumbTrail {
             self.points.drain(0..excess);
         }
         RecordOutcome::Recorded { point, proximity }
+    }
+
+    /// Evaluates proximity of `local_pos` inside a rotating planet/moon container (`zone_key`)
+    /// against prior breadcrumbs recorded in the same body container (zero rotation drift!).
+    pub fn evaluate_local_proximity_excluding_recent(
+        &self,
+        zone_key: &str,
+        local_pos: SpaceCoord,
+        visited_radius_km: f64,
+        now: DateTime<Utc>,
+        ignore_recent_secs: i64,
+    ) -> BreadcrumbProximity {
+        let radius = visited_radius_km.max(0.5);
+        let approach_radius = radius * Self::APPROACHING_MULTIPLIER;
+
+        let mut nearest: Option<(&BreadcrumbPoint, f64)> = None;
+        let mut nearby_count = 0usize;
+        let mut last_same_zone: Option<SpaceCoord> = None;
+
+        for pt in &self.points {
+            let (Some(pz), Some(pc)) = (pt.local_zone.as_deref(), pt.local_coord) else {
+                continue;
+            };
+            if !zones_match(pz, zone_key) {
+                continue;
+            }
+            last_same_zone = Some(pc);
+            let age_secs = (now - pt.recorded_at).num_seconds().max(0);
+            if ignore_recent_secs > 0 && age_secs < ignore_recent_secs {
+                continue;
+            }
+            let d_km = local_pos.distance_km(&pc);
+            if d_km <= radius {
+                nearby_count += 1;
+            }
+            if nearest.map(|(_, best)| d_km < best).unwrap_or(true) {
+                nearest = Some((pt, d_km));
+            }
+        }
+
+        // Heading on 2D North-Up ENU radar (`atan2(d_north, d_east)`)
+        let heading_rad = last_same_zone.and_then(|prev| {
+            let d = [
+                local_pos.x - prev.x,
+                local_pos.y - prev.y,
+                local_pos.z - prev.z,
+            ];
+            if let Some((east, north, _)) = planetary_enu_basis(local_pos) {
+                let de = d[0] * east[0] + d[1] * east[1] + d[2] * east[2];
+                let dn = d[0] * north[0] + d[1] * north[1] + d[2] * north[2];
+                if de * de + dn * dn >= 64.0 {
+                    Some(dn.atan2(de))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        match nearest {
+            Some((pt, d_km)) => {
+                let zone = if d_km <= radius {
+                    ProximityZone::Visited
+                } else if d_km <= approach_radius {
+                    ProximityZone::Approaching
+                } else {
+                    ProximityZone::Clear
+                };
+                let age_secs = (now - pt.recorded_at).num_seconds().max(0);
+                BreadcrumbProximity {
+                    zone,
+                    nearest_id: Some(pt.id),
+                    nearest_distance_km: Some(d_km),
+                    nearest_age_secs: Some(age_secs),
+                    nearby_count,
+                    heading_rad,
+                }
+            }
+            None => BreadcrumbProximity {
+                zone: ProximityZone::Clear,
+                nearest_id: None,
+                nearest_distance_km: None,
+                nearest_age_secs: None,
+                nearby_count: 0,
+                heading_rad,
+            },
+        }
+    }
+
+    /// Records a new `/showlocation` coordinate and returns its proximity to prior points.
+    pub fn record(
+        &mut self,
+        coord: SpaceCoord,
+        visited_radius_km: f64,
+        label: Option<String>,
+        now: DateTime<Utc>,
+    ) -> RecordOutcome {
+        self.record_with_local(coord, None, visited_radius_km, label, now)
     }
 
     /// Evaluates the latest recorded point against all earlier points in the trail.
@@ -715,6 +879,135 @@ impl BreadcrumbTrail {
         })
     }
 
+    /// Builds the render-ready overlay state for the breadcrumb cloud & mini-map, automatically
+    /// using zero-drift planetary local coordinates + North-Up ENU radar projection when inside
+    /// a rotating planet/moon container (`live_body`), and falling back to solar-system `Root Pos`
+    /// in deep space / asteroid belts.
+    pub fn build_overlay_info_dual(
+        &self,
+        visited_radius_km: f64,
+        radar_range_km: f64,
+        show_screen_cloud: bool,
+        live_root: Option<SpaceCoord>,
+        live_body: Option<(&str, SpaceCoord)>,
+        now: DateTime<Utc>,
+    ) -> Option<BreadcrumbOverlayInfo> {
+        let Some((zone_key, body_pos)) = live_body else {
+            return self.build_overlay_info(
+                visited_radius_km,
+                radar_range_km,
+                show_screen_cloud,
+                live_root,
+                now,
+            );
+        };
+
+        let radius = visited_radius_km.max(0.5);
+        let eff_radar_km = if radar_range_km > 0.0 {
+            radar_range_km.clamp(0.5, 5_000.0)
+        } else {
+            (radius * 3.0).max(10.0)
+        };
+        let max_planar_km = (eff_radar_km * 2.5).max(250.0);
+        // Short 30-second wake filter prevents instant self-hit while flying straight,
+        // yet immediately triggers AMBER/RED when you turn around and backtrack!
+        let prox =
+            self.evaluate_local_proximity_excluding_recent(zone_key, body_pos, radius, now, 30);
+        let enu = planetary_enu_basis(body_pos);
+
+        let mut render_points = Vec::with_capacity(self.points.len() + 1);
+        let mut zone_pt_count = 0usize;
+        let mut last_zone_pt: Option<SpaceCoord> = None;
+
+        for pt in &self.points {
+            let (Some(pz), Some(pc)) = (pt.local_zone.as_deref(), pt.local_coord) else {
+                continue;
+            };
+            if !zones_match(pz, zone_key) {
+                continue;
+            }
+            zone_pt_count += 1;
+            last_zone_pt = Some(pc);
+
+            let d_m = [pc.x - body_pos.x, pc.y - body_pos.y, pc.z - body_pos.z];
+            let (dx_km, dy_km, dz_km) = if let Some((east, north, up)) = enu {
+                let de = (d_m[0] * east[0] + d_m[1] * east[1] + d_m[2] * east[2]) / 1000.0;
+                let dn = (d_m[0] * north[0] + d_m[1] * north[1] + d_m[2] * north[2]) / 1000.0;
+                let du = (d_m[0] * up[0] + d_m[1] * up[1] + d_m[2] * up[2]) / 1000.0;
+                (de, dn, du)
+            } else {
+                (d_m[0] / 1000.0, d_m[1] / 1000.0, d_m[2] / 1000.0)
+            };
+
+            let planar_km = (dx_km * dx_km + dy_km * dy_km).sqrt();
+            if planar_km <= max_planar_km {
+                let age_mins = ((now - pt.recorded_at).num_seconds().max(0) / 60) as u32;
+                render_points.push(BreadcrumbRenderPoint {
+                    id: pt.id,
+                    dx_km,
+                    dy_km,
+                    dz_km,
+                    age_mins,
+                    is_current: false,
+                });
+            }
+        }
+
+        render_points.push(BreadcrumbRenderPoint {
+            id: self.next_id,
+            dx_km: 0.0,
+            dy_km: 0.0,
+            dz_km: 0.0,
+            age_mins: 0,
+            is_current: true,
+        });
+
+        let headline = match (prox.zone, prox.nearest_id, prox.nearest_distance_km) {
+            (ProximityZone::Visited, Some(id), Some(dist)) => {
+                let age = format_age(prox.nearest_age_secs.unwrap_or(0));
+                format!("VISITED CLOUD - {:.1} km from #{} ({})", dist, id, age)
+            }
+            (ProximityZone::Approaching, Some(id), Some(dist)) => {
+                let age = format_age(prox.nearest_age_secs.unwrap_or(0));
+                format!("ENTERING VISITED - {:.1} km from #{} ({})", dist, id, age)
+            }
+            (_, Some(id), Some(dist)) => {
+                format!("FRESH GROUND - {:.1} km from #{}", dist, id)
+            }
+            _ => format!("ZONE LOCK {} - Tracking", zone_key.to_ascii_uppercase()),
+        };
+
+        let dalt_txt = last_zone_pt
+            .map(|last| {
+                let r_cur =
+                    (body_pos.x * body_pos.x + body_pos.y * body_pos.y + body_pos.z * body_pos.z)
+                        .sqrt();
+                let r_last = (last.x * last.x + last.y * last.y + last.z * last.z).sqrt();
+                format!("  |  dAlt {:+.1} km", (r_cur - r_last) / 1000.0)
+            })
+            .unwrap_or_default();
+
+        let subline = format!(
+            "{} pts ({})  |  Cloud {:.0} km{}",
+            zone_pt_count,
+            zone_key.to_ascii_uppercase(),
+            radius,
+            dalt_txt
+        );
+
+        Some(BreadcrumbOverlayInfo {
+            zone: prox.zone,
+            headline,
+            subline,
+            visited_radius_km: radius,
+            radar_range_km: eff_radar_km,
+            heading_rad: prox.heading_rad,
+            show_screen_cloud,
+            points: render_points,
+            active_waypoint: None,
+        })
+    }
+
     /// Builds the render-ready overlay state for the breadcrumb cloud & mini-map.
     ///
     /// If `live_pos` is provided (from `r_DisplayInfo` OCR), the radar centers on `live_pos`
@@ -723,11 +1016,18 @@ impl BreadcrumbTrail {
     pub fn build_overlay_info(
         &self,
         visited_radius_km: f64,
+        radar_range_km: f64,
         show_screen_cloud: bool,
         live_pos: Option<SpaceCoord>,
         now: DateTime<Utc>,
     ) -> Option<BreadcrumbOverlayInfo> {
         let radius = visited_radius_km.max(0.5);
+        let eff_radar_km = if radar_range_km > 0.0 {
+            radar_range_km.clamp(0.5, 5_000.0)
+        } else {
+            (radius * 3.0).max(10.0)
+        };
+        let max_planar_km = (eff_radar_km * 2.5).max(250.0);
         let (center_coord, prox, center_id, use_live) = if let Some(live) = live_pos {
             if self.points.is_empty() {
                 (
@@ -744,9 +1044,9 @@ impl BreadcrumbTrail {
                     true,
                 )
             } else {
-                // Ignore breadcrumbs dropped within the last 90 seconds so your own immediate wake
-                // doesn't trigger "VISITED CLOUD - 0.0 km" right after dropping a point.
-                let p = self.evaluate_proximity_excluding_recent(live, radius, now, 90);
+                // Ignore breadcrumbs dropped within the last 30 seconds so flying straight forward
+                // doesn't self-trigger, while turning around & backtracking alerts promptly.
+                let p = self.evaluate_proximity_excluding_recent(live, radius, now, 30);
                 (live, p, self.next_id, true)
             }
         } else {
@@ -761,11 +1061,9 @@ impl BreadcrumbTrail {
             let dx_km = (pt.coord.x - center_coord.x) / 1000.0;
             let dy_km = (pt.coord.y - center_coord.y) / 1000.0;
             let dz_km = (pt.coord.z - center_coord.z) / 1000.0;
-            // Keep points within a local 250 km radar window so jumping across the star system
-            // doesn't squash the local asteroid-belt radar view.
             let planar_km = (dx_km * dx_km + dy_km * dy_km).sqrt();
             let is_current = !use_live && idx == last_idx;
-            if is_current || planar_km <= 250.0 {
+            if is_current || planar_km <= max_planar_km {
                 let age_mins = ((now - pt.recorded_at).num_seconds().max(0) / 60) as u32;
                 render_points.push(BreadcrumbRenderPoint {
                     id: pt.id,
@@ -844,6 +1142,7 @@ impl BreadcrumbTrail {
             headline,
             subline,
             visited_radius_km: radius,
+            radar_range_km: eff_radar_km,
             heading_rad: prox.heading_rad,
             show_screen_cloud,
             points: render_points,
@@ -914,26 +1213,28 @@ impl DisplayInfoStabilizer {
         dual_line_confirmed: bool,
         now: DateTime<Utc>,
     ) -> Option<SpaceCoord> {
-        if dual_line_confirmed {
-            self.last_accepted = Some((coord, now));
-            self.pending = None;
-            return Some(coord);
-        }
-
         if let Some((prev, prev_ts)) = self.last_accepted {
-            let dt = (now - prev_ts).num_seconds().max(1) as f64;
-            let max_plausible_km = (dt * 2.0).max(15.0);
+            let dt = ((now - prev_ts).num_milliseconds().max(100) as f64) / 1000.0;
+            let max_plausible_km = (dt * 2.5).clamp(1.5, 45.0);
             if coord.distance_km(&prev) <= max_plausible_km {
                 self.last_accepted = Some((coord, now));
                 self.pending = None;
                 return Some(coord);
             }
+            // Large jump (> max_plausible_km): even if dual_line_confirmed (both stacked lines
+            // can clip the same leading digits over bright sky), require 2 consecutive consistent
+            // frames before accepting so a single OCR glitch can never bounce by 40,000 Mm.
+        } else if dual_line_confirmed {
+            // Very first lock with dual-line confirmation: accept immediately.
+            self.last_accepted = Some((coord, now));
+            self.pending = None;
+            return Some(coord);
         }
 
         // First reading or large jump (Quantum Travel vs OCR misread): require 2 consistent reads
         if let Some((pend, pend_ts)) = self.pending {
-            let dt = (now - pend_ts).num_seconds().max(1) as f64;
-            if dt <= 45.0 && coord.distance_km(&pend) <= (dt * 2.0).max(12.0) {
+            let dt = ((now - pend_ts).num_milliseconds().max(100) as f64) / 1000.0;
+            if dt <= 25.0 && coord.distance_km(&pend) <= (dt * 2.5).clamp(1.5, 25.0) {
                 self.last_accepted = Some((coord, now));
                 self.pending = None;
                 return Some(coord);
@@ -977,12 +1278,45 @@ impl DisplayInfoStabilizer {
 pub struct LocalBodyStabilizer {
     last_accepted: Option<(String, String, SpaceCoord, DateTime<Utc>)>,
     pending: Option<(String, String, SpaceCoord, DateTime<Utc>)>,
+    last_drop: Option<(String, SpaceCoord, DateTime<Utc>)>,
 }
 
 impl LocalBodyStabilizer {
+    pub const MIN_AUTO_DROP_DISTANCE_M: f64 = 250.0;
+
     pub fn reset(&mut self) {
         self.last_accepted = None;
         self.pending = None;
+        self.last_drop = None;
+    }
+
+    pub fn should_auto_drop(
+        &mut self,
+        norm_key: &str,
+        coord: SpaceCoord,
+        interval_secs: i64,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let interval = interval_secs.clamp(5, 300);
+        match &self.last_drop {
+            None => {
+                self.last_drop = Some((norm_key.to_string(), coord, now));
+                true
+            }
+            Some((prev_key, prev_coord, prev_ts)) => {
+                let same_zone = zones_match(prev_key, norm_key);
+                let elapsed = (now - *prev_ts).num_seconds();
+                if !same_zone
+                    || (elapsed >= interval
+                        && coord.distance_m(prev_coord) >= Self::MIN_AUTO_DROP_DISTANCE_M)
+                {
+                    self.last_drop = Some((norm_key.to_string(), coord, now));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     /// Validates a planetary/moon body OCR reading `(display_name, norm_key, coord)`.
@@ -994,10 +1328,12 @@ impl LocalBodyStabilizer {
         now: DateTime<Utc>,
     ) -> Option<(String, String, SpaceCoord)> {
         if let Some((_, prev_key, prev_coord, prev_ts)) = &self.last_accepted {
-            let dt = (now - *prev_ts).num_seconds().max(1) as f64;
-            if *prev_key == norm_key && dt <= 60.0 {
-                let max_plausible_km = (dt * 2.5).max(15.0);
-                if coord.distance_km(prev_coord) <= max_plausible_km {
+            let dt_s = ((now - *prev_ts).num_milliseconds().max(100) as f64) / 1000.0;
+            if *prev_key == norm_key && dt_s <= 60.0 {
+                // Sub-quantum flight around/on a planet is <= ~1,500 m/s; reject single-digit
+                // OCR teleports (e.g. 2-3 km jumps in 0.2 s) so heading never gets poisoned.
+                let max_plausible_m = (dt_s * 1_600.0).clamp(350.0, 12_000.0);
+                if coord.distance_m(prev_coord) <= max_plausible_m {
                     let out = (display_name, norm_key, coord);
                     self.last_accepted = Some((out.0.clone(), out.1.clone(), out.2, now));
                     self.pending = None;
@@ -1006,10 +1342,13 @@ impl LocalBodyStabilizer {
             }
         }
 
-        // First reading in a zone or large jump: confirm with 2 consistent frames
+        // First reading in a zone or large jump (e.g. orbital QT): confirm with 2 consistent frames
         if let Some((_, pend_key, pend_coord, pend_ts)) = &self.pending {
-            let dt = (now - *pend_ts).num_seconds().max(1) as f64;
-            if *pend_key == norm_key && dt <= 20.0 && coord.distance_km(pend_coord) <= (dt * 2.5).max(15.0)
+            let dt_s = ((now - *pend_ts).num_milliseconds().max(100) as f64) / 1000.0;
+            let max_plausible_m = (dt_s * 1_600.0).clamp(350.0, 12_000.0);
+            if *pend_key == norm_key
+                && dt_s <= 20.0
+                && coord.distance_m(pend_coord) <= max_plausible_m
             {
                 let out = (display_name, norm_key, coord);
                 self.last_accepted = Some((out.0.clone(), out.1.clone(), out.2, now));
@@ -1022,4 +1361,3 @@ impl LocalBodyStabilizer {
         None
     }
 }
-
